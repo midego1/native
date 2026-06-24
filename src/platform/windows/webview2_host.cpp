@@ -31,7 +31,15 @@ enum EventKind {
     kShutdown = 2,
     kResize = 3,
     kWindowFrame = 4,
+    kShortcut = 5,
 };
+
+constexpr uint32_t kShortcutModifierPrimary = 1u << 0;
+constexpr uint32_t kShortcutModifierCommand = 1u << 1;
+constexpr uint32_t kShortcutModifierControl = 1u << 2;
+constexpr uint32_t kShortcutModifierOption = 1u << 3;
+constexpr uint32_t kShortcutModifierShift = 1u << 4;
+constexpr size_t kMaxShortcuts = 64;
 
 struct WindowsEvent {
     int kind;
@@ -47,6 +55,11 @@ struct WindowsEvent {
     size_t label_len;
     const char *title;
     size_t title_len;
+    const char *shortcut_id;
+    size_t shortcut_id_len;
+    const char *shortcut_key;
+    size_t shortcut_key_len;
+    uint32_t shortcut_modifiers;
 };
 
 using EventCallback = void (*)(void *, const WindowsEvent *);
@@ -83,6 +96,12 @@ struct ChildWebView {
 #endif
 };
 
+struct Shortcut {
+    std::string id;
+    std::string key;
+    uint32_t modifiers = 0;
+};
+
 struct HostLifetime {
     std::recursive_mutex mutex;
     bool alive = true;
@@ -104,12 +123,42 @@ struct Host {
     uint64_t next_webview_order = 1;
     std::vector<std::string> allowed_origins;
     std::vector<std::string> allowed_external_urls;
+    std::vector<Shortcut> shortcuts;
     int external_link_action = 0;
     std::shared_ptr<HostLifetime> lifetime = std::make_shared<HostLifetime>();
 };
 
 static std::string slice(const char *bytes, size_t len) {
     return bytes && len > 0 ? std::string(bytes, len) : std::string();
+}
+
+static std::string jsonStringLiteral(const std::string &value) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    out += "\\u00";
+                    out.push_back(hex[(ch >> 4) & 0xf]);
+                    out.push_back(hex[ch & 0xf]);
+                } else {
+                    out.push_back(static_cast<char>(ch));
+                }
+                break;
+        }
+    }
+    out.push_back('"');
+    return out;
 }
 
 static std::wstring widen(const std::string &value) {
@@ -198,6 +247,115 @@ static void emit(Host *host, const Window &window, EventKind kind) {
     host->callback(host->callback_context, &event);
 }
 
+static std::string shortcutKeyFromWParam(WPARAM wparam) {
+    if (wparam >= 'A' && wparam <= 'Z') return std::string(1, static_cast<char>('a' + (wparam - 'A')));
+    if (wparam >= '0' && wparam <= '9') return std::string(1, static_cast<char>(wparam));
+    switch (wparam) {
+        case VK_ESCAPE: return "escape";
+        case VK_RETURN: return "enter";
+        case VK_TAB: return "tab";
+        case VK_SPACE: return "space";
+        case VK_BACK: return "backspace";
+        case VK_LEFT: return "arrowleft";
+        case VK_RIGHT: return "arrowright";
+        case VK_UP: return "arrowup";
+        case VK_DOWN: return "arrowdown";
+        case VK_OEM_PLUS: return "=";
+        case VK_OEM_MINUS: return "-";
+        case VK_OEM_COMMA: return ",";
+        case VK_OEM_PERIOD: return ".";
+        case VK_OEM_2: return "/";
+        case VK_OEM_1: return ";";
+        case VK_OEM_7: return "'";
+        case VK_OEM_4: return "[";
+        case VK_OEM_6: return "]";
+        case VK_OEM_5: return "\\";
+        case VK_OEM_3: return "`";
+        default: return std::string();
+    }
+}
+
+static bool keyDown(int virtual_key) {
+    return (GetKeyState(virtual_key) & 0x8000) != 0;
+}
+
+static bool shortcutKeyCanUseImplicitShift(const std::string &key) {
+    if (key.size() != 1) return false;
+    char ch = key[0];
+    return (ch >= '0' && ch <= '9') ||
+        ch == '=' || ch == '-' || ch == ',' ||
+        ch == '.' || ch == '/' || ch == ';' || ch == '\'' ||
+        ch == '[' || ch == ']' || ch == '\\' || ch == '`';
+}
+
+static bool shortcutModifiersMatch(uint32_t shortcut_modifiers, bool allow_implicit_shift) {
+    bool needs_control = (shortcut_modifiers & kShortcutModifierControl) != 0 ||
+        (shortcut_modifiers & kShortcutModifierPrimary) != 0;
+    bool needs_command = (shortcut_modifiers & kShortcutModifierCommand) != 0;
+    bool needs_option = (shortcut_modifiers & kShortcutModifierOption) != 0;
+    bool needs_shift = (shortcut_modifiers & kShortcutModifierShift) != 0;
+    bool has_control = keyDown(VK_CONTROL);
+    bool has_command = keyDown(VK_LWIN) || keyDown(VK_RWIN);
+    bool has_option = keyDown(VK_MENU);
+    bool has_shift = keyDown(VK_SHIFT);
+    bool shift_matches = needs_shift ? has_shift : (!has_shift || allow_implicit_shift);
+    return has_control == needs_control &&
+        has_command == needs_command &&
+        has_option == needs_option &&
+        shift_matches;
+}
+
+static const Window *windowForId(Host *host, uint64_t window_id) {
+    if (!host) return nullptr;
+    auto found = host->windows.find(window_id);
+    if (found == host->windows.end()) return nullptr;
+    return &found->second;
+}
+
+static const Window *windowForHwnd(Host *host, HWND hwnd) {
+    if (!host) return nullptr;
+    for (auto &entry : host->windows) {
+        if (entry.second.hwnd == hwnd) return &entry.second;
+    }
+    return nullptr;
+}
+
+static bool emitShortcutForWindow(Host *host, const Window *window, WPARAM wparam) {
+    if (!host || host->shortcuts.empty()) return false;
+    if (!window) return false;
+    std::string key = shortcutKeyFromWParam(wparam);
+    if (key.empty()) return false;
+    bool uses_implicit_shift = keyDown(VK_SHIFT) && shortcutKeyCanUseImplicitShift(key);
+    const int pass_count = uses_implicit_shift ? 2 : 1;
+    for (int pass = 0; pass < pass_count; ++pass) {
+        bool allow_implicit_shift = pass == 1;
+        for (const Shortcut &shortcut : host->shortcuts) {
+            if (shortcut.key != key) continue;
+            if (!shortcutModifiersMatch(shortcut.modifiers, allow_implicit_shift)) continue;
+            if (!host->callback) return true;
+            WindowsEvent event = {};
+            event.kind = kShortcut;
+            event.window_id = window->id;
+            event.shortcut_id = shortcut.id.c_str();
+            event.shortcut_id_len = shortcut.id.size();
+            event.shortcut_key = shortcut.key.c_str();
+            event.shortcut_key_len = shortcut.key.size();
+            event.shortcut_modifiers = shortcut.modifiers;
+            host->callback(host->callback_context, &event);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool emitShortcutForHwnd(Host *host, HWND hwnd, WPARAM wparam) {
+    return emitShortcutForWindow(host, windowForHwnd(host, hwnd), wparam);
+}
+
+static bool emitShortcutForWindowId(Host *host, uint64_t window_id, WPARAM wparam) {
+    return emitShortcutForWindow(host, windowForId(host, window_id), wparam);
+}
+
 static std::string webViewKey(uint64_t window_id, const std::string &label) {
     return std::to_string(window_id) + ":" + label;
 }
@@ -242,6 +400,75 @@ static void destroyAllWindows(Host *host) {
 
 #if ZERO_NATIVE_HAS_WEBVIEW2
 using CreateEnvironmentFn = HRESULT (STDAPICALLTYPE *)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
+
+static const wchar_t *zeroNativeBridgeScript() {
+    return LR"ZN((function(){
+	if(window.zero&&window.zero.invoke&&window.zero.on&&window.zero._emit){return;}
+	var pending=new Map();
+	var listeners=new Map();
+	var nextId=1;
+	function post(message){
+	if(window.chrome&&window.chrome.webview&&window.chrome.webview.postMessage){window.chrome.webview.postMessage(message);return;}
+	throw new Error('zero-native bridge transport is unavailable');
+	}
+	function complete(response){
+	var id=response&&response.id!=null?String(response.id):'';
+	var entry=pending.get(id);
+	if(!entry){return;}
+	pending.delete(id);
+	if(response.ok){entry.resolve(response.result===undefined?null:response.result);return;}
+	var errorInfo=response.error||{};
+	var error=new Error(errorInfo.message||'Native command failed');
+	error.code=errorInfo.code||'internal_error';
+	entry.reject(error);
+	}
+	function invoke(command,payload){
+	if(typeof command!=='string'||command.length===0){return Promise.reject(new TypeError('command must be a non-empty string'));}
+	var id=String(nextId++);
+	var envelope=JSON.stringify({id:id,command:command,payload:payload===undefined?null:payload});
+	return new Promise(function(resolve,reject){
+	pending.set(id,{resolve:resolve,reject:reject});
+	try{post(envelope);}catch(error){pending.delete(id);reject(error);}
+	});
+	}
+	function selector(value){return typeof value==='number'?{id:value}:{label:String(value)};}
+	function ensureString(value,name){if(typeof value!=='string'||value.length===0){throw new TypeError(name+' must be a non-empty string');}return value;}
+	function ensureNumber(value,name){if(typeof value!=='number'||!isFinite(value)){throw new TypeError(name+' must be a finite number');}return value;}
+	function validateWebViewSelector(options){if(options.label!=null){ensureString(options.label,'label');}if(options.windowId!=null&&(typeof options.windowId!=='number'||!isFinite(options.windowId)||options.windowId<0||Math.floor(options.windowId)!==options.windowId)){throw new TypeError('windowId must be a non-negative integer');}}
+	function framePayload(options){options=options||{};validateWebViewSelector(options);var frame=options.frame||options;return {label:options.label,windowId:options.windowId,url:options.url,frame:{x:frame.x==null?0:ensureNumber(frame.x,'frame.x'),y:frame.y==null?0:ensureNumber(frame.y,'frame.y'),width:ensureNumber(frame.width,'frame.width'),height:ensureNumber(frame.height,'frame.height')}};}
+	function createPayload(options){options=options||{};ensureString(options.url,'url');var payload=framePayload(options);if(options.layer!=null){payload.layer=ensureNumber(options.layer,'layer');}if(options.transparent!=null){payload.transparent=!!options.transparent;}if(options.bridge!=null){payload.bridge=!!options.bridge;}return payload;}
+	function navigatePayload(options){options=options||{};validateWebViewSelector(options);ensureString(options.url,'url');return {label:options.label,windowId:options.windowId,url:options.url};}
+	function closePayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId};}
+	function webviewHandle(info){return Object.freeze(Object.assign({},info,{setFrame:function(frame){return webviews.setFrame({label:info.label,windowId:info.windowId,frame:frame});},navigate:function(url){return webviews.navigate({label:info.label,windowId:info.windowId,url:url});},setZoom:function(zoom){return webviews.setZoom({label:info.label,windowId:info.windowId,zoom:zoom});},setLayer:function(layer){return webviews.setLayer({label:info.label,windowId:info.windowId,layer:layer});},close:function(){return webviews.close({label:info.label,windowId:info.windowId});}}));}
+	function on(name,callback){if(typeof callback!=='function'){throw new TypeError('callback must be a function');}var set=listeners.get(name);if(!set){set=new Set();listeners.set(name,set);}set.add(callback);return function(){off(name,callback);};}
+	function off(name,callback){var set=listeners.get(name);if(set){set.delete(callback);if(set.size===0){listeners.delete(name);}}}
+	function emit(name,detail){var set=listeners.get(name);if(set){Array.from(set).forEach(function(callback){callback(detail);});}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));}
+	var windows=Object.freeze({
+	create:function(options){return invoke('zero-native.window.create',options||{});},
+	list:function(){return invoke('zero-native.window.list',{});},
+	focus:function(value){return invoke('zero-native.window.focus',selector(value));},
+	close:function(value){return invoke('zero-native.window.close',selector(value));}
+	});
+	var dialogs=Object.freeze({
+	openFile:function(options){return invoke('zero-native.dialog.openFile',options||{});},
+	saveFile:function(options){return invoke('zero-native.dialog.saveFile',options||{});},
+	showMessage:function(options){return invoke('zero-native.dialog.showMessage',options||{});}
+	});
+	function zoomPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,zoom:ensureNumber(options.zoom,'zoom')};}
+	function layerPayload(options){options=options||{};validateWebViewSelector(options);return {label:options.label,windowId:options.windowId,layer:ensureNumber(options.layer,'layer')};}
+	var webviews=Object.freeze({
+	create:function(options){return invoke('zero-native.webview.create',createPayload(options)).then(webviewHandle);},
+	list:function(){return invoke('zero-native.webview.list',{});},
+	setFrame:function(options){return invoke('zero-native.webview.setFrame',framePayload(options));},
+	navigate:function(options){return invoke('zero-native.webview.navigate',navigatePayload(options));},
+	setZoom:function(options){return invoke('zero-native.webview.setZoom',zoomPayload(options));},
+	setLayer:function(options){return invoke('zero-native.webview.setLayer',layerPayload(options));},
+	close:function(options){return invoke('zero-native.webview.close',closePayload(options));}
+	});
+	try{Object.defineProperty(window,'zero',{value:Object.freeze({invoke:invoke,on:on,off:off,windows:windows,dialogs:dialogs,webviews:webviews,_complete:complete,_emit:emit}),configurable:false});}catch(error){}
+	})();
+	)ZN";
+}
 
 static RECT webViewRect(const ChildWebView &webview) {
     RECT rect = {};
@@ -314,6 +541,63 @@ static bool createChildWebView(Host *host, const std::string &key) {
                     controller->put_ZoomFactor(found->second.zoom);
                     controller->put_IsVisible(TRUE);
                     if (found->second.webview) {
+                        if (found->second.bridge_enabled) {
+                            found->second.webview->AddScriptToExecuteOnDocumentCreated(zeroNativeBridgeScript(), nullptr);
+                            EventRegistrationToken bridge_token = {};
+                            uint64_t bridge_window_id = found->second.window_id;
+                            std::string bridge_label = found->second.label;
+                            found->second.webview->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                [host, bridge_window_id, bridge_label, lifetime](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
+                                    auto token = lifetime.lock();
+                                    if (!token) return S_OK;
+                                    std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                                    if (!token->alive || !args || !host->bridge_callback) return S_OK;
+
+                                    LPWSTR message_bytes = nullptr;
+                                    if (FAILED(args->TryGetWebMessageAsString(&message_bytes)) || !message_bytes) return S_OK;
+                                    std::wstring message_wide(message_bytes);
+                                    CoTaskMemFree(message_bytes);
+                                    std::string message = narrow(message_wide);
+
+                                    std::string origin = "zero://inline";
+                                    LPWSTR source_bytes = nullptr;
+                                    if (SUCCEEDED(args->get_Source(&source_bytes)) && source_bytes) {
+                                        std::wstring source_wide(source_bytes);
+                                        CoTaskMemFree(source_bytes);
+                                        origin = originForUrl(narrow(source_wide));
+                                    }
+
+                                    host->bridge_callback(
+                                        host->bridge_context,
+                                        bridge_window_id,
+                                        bridge_label.c_str(),
+                                        bridge_label.size(),
+                                        message.c_str(),
+                                        message.size(),
+                                        origin.c_str(),
+                                        origin.size());
+                                    return S_OK;
+                                }).Get(), &bridge_token);
+                        }
+                        EventRegistrationToken accelerator_token = {};
+                        uint64_t accelerator_window_id = found->second.window_id;
+                        found->second.controller->add_AcceleratorKeyPressed(Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+                            [host, accelerator_window_id, lifetime](ICoreWebView2Controller *, ICoreWebView2AcceleratorKeyPressedEventArgs *args) -> HRESULT {
+                                auto token = lifetime.lock();
+                                if (!token) return S_OK;
+                                std::lock_guard<std::recursive_mutex> guard(token->mutex);
+                                if (!token->alive || !args) return S_OK;
+                                COREWEBVIEW2_KEY_EVENT_KIND kind = COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
+                                if (FAILED(args->get_KeyEventKind(&kind))) return S_OK;
+                                if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN) return S_OK;
+                                UINT virtual_key = 0;
+                                if (FAILED(args->get_VirtualKey(&virtual_key))) return S_OK;
+                                if (emitShortcutForWindowId(host, accelerator_window_id, virtual_key)) {
+                                    args->put_Handled(TRUE);
+                                }
+                                return S_OK;
+                            }).Get(), &accelerator_token);
+
                         EventRegistrationToken token = {};
                         found->second.webview->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
                             [host, lifetime](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
@@ -381,6 +665,10 @@ static LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wparam, LPARA
     }
     Host *host = hostFromWindow(hwnd);
     switch (message) {
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+            if (host && emitShortcutForHwnd(host, hwnd, wparam)) return 0;
+            break;
         case WM_SIZE:
             if (host) {
                 for (auto &entry : host->windows) {
@@ -562,21 +850,46 @@ void zero_native_windows_bridge_respond_window(Host *host, uint64_t window_id, c
 }
 
 void zero_native_windows_bridge_respond_webview(Host *host, uint64_t window_id, const char *webview_label, size_t webview_label_len, const char *response, size_t response_len) {
+#if ZERO_NATIVE_HAS_WEBVIEW2
+    if (!host) return;
+    std::string label = slice(webview_label, webview_label_len);
+    auto found = host->webviews.find(webViewKey(window_id, label));
+    if (found == host->webviews.end() || !found->second.webview) return;
+    std::string response_string = response && response_len > 0 ? slice(response, response_len) : std::string("{}");
+    std::string script = "window.zero&&window.zero._complete(" + response_string + ");";
+    std::wstring script_wide = widen(script);
+    found->second.webview->ExecuteScript(script_wide.c_str(), nullptr);
+#else
     (void)host;
     (void)window_id;
     (void)webview_label;
     (void)webview_label_len;
     (void)response;
     (void)response_len;
+#endif
 }
 
 void zero_native_windows_emit_window_event(Host *host, uint64_t window_id, const char *name, size_t name_len, const char *detail_json, size_t detail_json_len) {
+#if ZERO_NATIVE_HAS_WEBVIEW2
+    if (!host) return;
+    std::string event_name = slice(name, name_len);
+    if (event_name.empty()) return;
+    std::string detail = detail_json && detail_json_len > 0 ? slice(detail_json, detail_json_len) : std::string("null");
+    std::string script = "(function(){var name=" + jsonStringLiteral(event_name) + ";var detail=" + detail + ";if(window.zero&&window.zero._emit){window.zero._emit(name,detail);return;}window.dispatchEvent(new CustomEvent('zero-native:'+name,{detail:detail}));})();";
+    std::wstring script_wide = widen(script);
+    for (auto &entry : host->webviews) {
+        ChildWebView &webview = entry.second;
+        if (webview.window_id != window_id || !webview.bridge_enabled || !webview.webview) continue;
+        webview.webview->ExecuteScript(script_wide.c_str(), nullptr);
+    }
+#else
     (void)host;
     (void)window_id;
     (void)name;
     (void)name_len;
     (void)detail_json;
     (void)detail_json_len;
+#endif
 }
 
 void zero_native_windows_set_security_policy(Host *host, const char *allowed_origins, size_t allowed_origins_len, const char *external_urls, size_t external_urls_len, int external_action) {
@@ -584,6 +897,24 @@ void zero_native_windows_set_security_policy(Host *host, const char *allowed_ori
     host->allowed_origins = parseNewlineList(allowed_origins, allowed_origins_len);
     host->allowed_external_urls = parseNewlineList(external_urls, external_urls_len);
     host->external_link_action = external_action;
+}
+
+void zero_native_windows_set_shortcuts(Host *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
+    if (!host) return;
+    host->shortcuts.clear();
+    if (!ids || !id_lens || !keys || !key_lens || !modifiers) return;
+    const size_t limit = count < kMaxShortcuts ? count : kMaxShortcuts;
+    for (size_t i = 0; i < limit; ++i) {
+        if (!ids[i] || !keys[i] || id_lens[i] == 0 || key_lens[i] == 0) continue;
+        Shortcut shortcut;
+        shortcut.id = slice(ids[i], id_lens[i]);
+        shortcut.key = slice(keys[i], key_lens[i]);
+        for (char &ch : shortcut.key) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        shortcut.modifiers = modifiers[i];
+        host->shortcuts.push_back(shortcut);
+    }
 }
 
 int zero_native_windows_create_window(Host *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame) {
@@ -638,7 +969,7 @@ int zero_native_windows_create_webview(Host *host, uint64_t window_id, const cha
     (void)bridge_enabled;
     return 0;
 #else
-    if (!host || label_len == 0 || url_len == 0 || !validChildWebViewFrame(x, y, width, height) || bridge_enabled) return 0;
+    if (!host || label_len == 0 || url_len == 0 || !validChildWebViewFrame(x, y, width, height)) return 0;
     auto window = host->windows.find(window_id);
     if (window == host->windows.end() || !window->second.hwnd) return 0;
     std::string label_string = slice(label, label_len);

@@ -13,6 +13,7 @@ pub const Error = error{
     WindowSourceTooLarge,
     FocusFailed,
     CloseFailed,
+    InvalidShortcut,
     MissingWebViewUrl,
     InvalidWebViewOptions,
     WebViewNotFound,
@@ -72,6 +73,75 @@ pub const max_window_source_bytes: usize = 4096;
 pub const max_webviews: usize = 16;
 pub const max_webview_label_bytes: usize = 64;
 pub const max_webview_url_bytes: usize = 4096;
+pub const max_shortcuts: usize = 64;
+pub const max_shortcut_id_bytes: usize = 64;
+pub const max_shortcut_key_bytes: usize = 32;
+
+pub const ShortcutModifiers = struct {
+    primary: bool = false,
+    command: bool = false,
+    control: bool = false,
+    option: bool = false,
+    shift: bool = false,
+
+    pub fn hasAny(self: ShortcutModifiers) bool {
+        return self.primary or self.command or self.control or self.option or self.shift;
+    }
+};
+
+pub const Shortcut = struct {
+    id: []const u8,
+    key: []const u8,
+    modifiers: ShortcutModifiers = .{},
+};
+
+pub const ShortcutEvent = struct {
+    id: []const u8,
+    key: []const u8,
+    modifiers: ShortcutModifiers = .{},
+    window_id: WindowId = 1,
+};
+
+pub fn validateShortcut(shortcut: Shortcut) Error!void {
+    if (shortcut.id.len == 0 or shortcut.id.len > max_shortcut_id_bytes) return error.InvalidShortcut;
+    if (!isValidShortcutKey(shortcut.key)) return error.InvalidShortcut;
+    if (!shortcut.modifiers.hasAny() and shortcutRequiresModifier(shortcut.key)) return error.InvalidShortcut;
+}
+
+pub fn isValidShortcutKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > max_shortcut_key_bytes) return false;
+    if (key.len == 1) {
+        const ch = key[0];
+        if (std.ascii.isAlphabetic(ch) or std.ascii.isDigit(ch)) return true;
+        return switch (ch) {
+            '=', '-', ',', '.', '/', ';', '\'', '[', ']', '\\', '`' => true,
+            else => false,
+        };
+    }
+    const specials = [_][]const u8{
+        "escape",
+        "enter",
+        "tab",
+        "space",
+        "backspace",
+        "arrowleft",
+        "arrowright",
+        "arrowup",
+        "arrowdown",
+    };
+    for (&specials) |special| {
+        if (std.ascii.eqlIgnoreCase(key, special)) return true;
+    }
+    return false;
+}
+
+fn shortcutRequiresModifier(key: []const u8) bool {
+    if (key.len == 1) return true;
+    return std.ascii.eqlIgnoreCase(key, "space") or
+        std.ascii.eqlIgnoreCase(key, "enter") or
+        std.ascii.eqlIgnoreCase(key, "tab") or
+        std.ascii.eqlIgnoreCase(key, "backspace");
+}
 
 pub const WindowRestorePolicy = enum {
     clamp_to_visible_screen,
@@ -293,6 +363,7 @@ pub const Event = union(enum) {
     window_focused: WindowId,
     bridge_message: BridgeMessage,
     tray_action: TrayItemId,
+    shortcut: ShortcutEvent,
 
     pub fn name(self: Event) []const u8 {
         return switch (self) {
@@ -304,6 +375,7 @@ pub const Event = union(enum) {
             .window_focused => "window_focused",
             .bridge_message => "bridge_message",
             .tray_action => "tray_action",
+            .shortcut => "shortcut",
         };
     }
 };
@@ -335,6 +407,7 @@ pub const PlatformServices = struct {
     update_tray_menu_fn: ?*const fn (context: ?*anyopaque, items: []const TrayMenuItem) anyerror!void = null,
     remove_tray_fn: ?*const fn (context: ?*anyopaque) anyerror!void = null,
     configure_security_policy_fn: ?*const fn (context: ?*anyopaque, policy: security.Policy) anyerror!void = null,
+    configure_shortcuts_fn: ?*const fn (context: ?*anyopaque, shortcuts: []const Shortcut) anyerror!void = null,
     emit_window_event_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, name: []const u8, detail_json: []const u8) anyerror!void = null,
 
     pub fn readClipboard(self: PlatformServices, buffer: []u8) anyerror![]const u8 {
@@ -457,6 +530,14 @@ pub const PlatformServices = struct {
         return configure_fn(self.context, policy);
     }
 
+    pub fn configureShortcuts(self: PlatformServices, shortcuts: []const Shortcut) anyerror!void {
+        const configure_fn = self.configure_shortcuts_fn orelse {
+            if (shortcuts.len == 0) return;
+            return error.UnsupportedService;
+        };
+        return configure_fn(self.context, shortcuts);
+    }
+
     pub fn emitWindowEvent(self: PlatformServices, window_id: WindowId, name: []const u8, detail_json: []const u8) anyerror!void {
         const emit_fn = self.emit_window_event_fn orelse return error.UnsupportedService;
         return emit_fn(self.context, window_id, name, detail_json);
@@ -494,6 +575,8 @@ pub const NullPlatform = struct {
     requested_frames: u32 = 1,
     loaded_source: ?WebViewSource = null,
     security_policy: security.Policy = .{},
+    shortcuts: [max_shortcuts]Shortcut = undefined,
+    shortcut_count: usize = 0,
     window_sources: [max_windows]?WebViewSource = [_]?WebViewSource{null} ** max_windows,
     windows: [max_windows]WindowInfo = undefined,
     window_count: usize = 0,
@@ -539,6 +622,7 @@ pub const NullPlatform = struct {
                 .set_webview_layer_fn = setWebViewLayer,
                 .close_webview_fn = closeWebView,
                 .configure_security_policy_fn = configureSecurityPolicy,
+                .configure_shortcuts_fn = configureShortcuts,
                 .emit_window_event_fn = emitWindowEvent,
             },
             .app_info = self.app_info,
@@ -744,6 +828,16 @@ pub const NullPlatform = struct {
         self.security_policy = policy;
     }
 
+    fn configureShortcuts(context: ?*anyopaque, shortcuts: []const Shortcut) anyerror!void {
+        const self: *NullPlatform = @ptrCast(@alignCast(context.?));
+        if (shortcuts.len > self.shortcuts.len) return error.InvalidShortcut;
+        for (shortcuts, 0..) |shortcut, index| {
+            try validateShortcut(shortcut);
+            self.shortcuts[index] = shortcut;
+        }
+        self.shortcut_count = shortcuts.len;
+    }
+
     fn emitWindowEvent(context: ?*anyopaque, window_id: WindowId, name: []const u8, detail_json: []const u8) anyerror!void {
         _ = context;
         _ = window_id;
@@ -808,6 +902,10 @@ pub const NullPlatform = struct {
 
     pub fn lastBridgeResponseWebViewLabel(self: *const NullPlatform) []const u8 {
         return self.bridge_response_webview_label;
+    }
+
+    pub fn configuredShortcuts(self: *const NullPlatform) []const Shortcut {
+        return self.shortcuts[0..self.shortcut_count];
     }
 };
 
@@ -875,6 +973,29 @@ test "null platform records bridge response window routing" {
     try std.testing.expectEqualStrings("{\"ok\":true}", null_platform.lastBridgeResponse());
 }
 
+test "null platform records configured shortcuts" {
+    const shortcuts = [_]Shortcut{
+        .{ .id = "command.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
+    };
+    var null_platform = NullPlatform.init(.{});
+    try null_platform.platform().services.configureShortcuts(&shortcuts);
+
+    try std.testing.expectEqual(@as(usize, 1), null_platform.configuredShortcuts().len);
+    try std.testing.expectEqualStrings("command.palette", null_platform.configuredShortcuts()[0].id);
+    try std.testing.expect(null_platform.configuredShortcuts()[0].modifiers.primary);
+    try std.testing.expect(null_platform.configuredShortcuts()[0].modifiers.shift);
+
+    const long_key = [_]u8{'x'} ** (max_shortcut_key_bytes + 1);
+    const invalid = [_]Shortcut{.{ .id = "invalid", .key = long_key[0..] }};
+    try std.testing.expectError(error.InvalidShortcut, null_platform.platform().services.configureShortcuts(&invalid));
+
+    const invalid_key = [_]Shortcut{.{ .id = "invalid", .key = "@" }};
+    try std.testing.expectError(error.InvalidShortcut, null_platform.platform().services.configureShortcuts(&invalid_key));
+
+    const unmodified_text_key = [_]Shortcut{.{ .id = "text", .key = "p" }};
+    try std.testing.expectError(error.InvalidShortcut, null_platform.platform().services.configureShortcuts(&unmodified_text_key));
+}
+
 test "webview bridge fallback only routes main responses" {
     const Recorder = struct {
         window_id: WindowId = 0,
@@ -897,6 +1018,16 @@ test "webview bridge fallback only routes main responses" {
     try std.testing.expectEqual(@as(WindowId, 3), recorder.window_id);
     try std.testing.expectEqualStrings("{\"ok\":true}", recorder.response);
     try std.testing.expectError(error.UnsupportedService, services.completeWebViewBridge(3, "preview", "{\"ok\":true}"));
+}
+
+test "shortcut configuration requires backend support for non-empty lists" {
+    const services = PlatformServices{};
+    try services.configureShortcuts(&.{});
+
+    const shortcuts = [_]Shortcut{
+        .{ .id = "command.palette", .key = "p", .modifiers = .{ .primary = true } },
+    };
+    try std.testing.expectError(error.UnsupportedService, services.configureShortcuts(&shortcuts));
 }
 
 test "null platform records webview lifecycle" {

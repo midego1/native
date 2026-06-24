@@ -9,6 +9,11 @@
 @class ZeroNativeAppKitHost;
 
 static const NSUInteger ZeroNativeMaxChildWebViews = 16;
+static const uint32_t ZeroNativeShortcutModifierPrimary = 1u << 0;
+static const uint32_t ZeroNativeShortcutModifierCommand = 1u << 1;
+static const uint32_t ZeroNativeShortcutModifierControl = 1u << 2;
+static const uint32_t ZeroNativeShortcutModifierOption = 1u << 3;
+static const uint32_t ZeroNativeShortcutModifierShift = 1u << 4;
 static NSRect constrainFrame(NSRect frame);
 static NSString *ZeroNativeAppKitBridgeScript(void);
 static NSString *ZeroNativeMimeTypeForPath(NSString *path);
@@ -18,6 +23,9 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath);
 static NSArray<NSString *> *ZeroNativePolicyListFromBytes(const char *bytes, size_t len, NSArray<NSString *> *fallback);
 static NSString *ZeroNativeOriginForURL(NSURL *url);
 static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url);
+static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event);
+static BOOL ZeroNativeShortcutUsesImplicitShift(NSString *key, NSEvent *event);
+static BOOL ZeroNativeShortcutModifiersMatch(uint32_t shortcutModifiers, NSEventModifierFlags eventModifiers, BOOL allowImplicitShift);
 
 @interface ZeroNativeWindowDelegate : NSObject <NSWindowDelegate>
 @property(nonatomic, assign) ZeroNativeAppKitHost *host;
@@ -39,6 +47,12 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 @property(nonatomic, strong) NSString *entryPath;
 @property(nonatomic, assign) BOOL spaFallback;
 - (void)configureWithRootPath:(NSString *)rootPath entryPath:(NSString *)entryPath spaFallback:(BOOL)spaFallback;
+@end
+
+@interface ZeroNativeShortcut : NSObject
+@property(nonatomic, strong) NSString *identifier;
+@property(nonatomic, strong) NSString *key;
+@property(nonatomic, assign) uint32_t modifiers;
 @end
 
 @interface ZeroNativeAppKitHost : NSObject <WKNavigationDelegate>
@@ -67,6 +81,7 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 @property(nonatomic, assign) BOOL didShutdown;
 @property(nonatomic, assign) NSInteger bridgeFrameKeepalive;
 @property(nonatomic, strong) id shortcutEventMonitor;
+@property(nonatomic, strong) NSArray<ZeroNativeShortcut *> *shortcuts;
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, assign) zero_native_appkit_tray_callback_t trayCallback;
 @property(nonatomic, assign) void *trayContext;
@@ -118,7 +133,9 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 - (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId;
 - (void)completeBridgeWithResponse:(NSString *)response windowId:(uint64_t)windowId webViewLabel:(NSString *)webViewLabel;
 - (void)emitEventNamed:(NSString *)name detailJSON:(NSString *)detailJSON windowId:(uint64_t)windowId;
+- (void)setShortcutsWithIds:(const char *const *)ids idLengths:(const size_t *)idLengths keys:(const char *const *)keys keyLengths:(const size_t *)keyLengths modifiers:(const uint32_t *)modifiers count:(size_t)count;
 - (BOOL)handleShortcutEvent:(NSEvent *)event;
+- (void)emitShortcutWithId:(NSString *)identifier key:(NSString *)key modifiers:(uint32_t)modifiers event:(NSEvent *)event;
 @end
 
 @implementation ZeroNativeWindowDelegate
@@ -261,6 +278,9 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
 
 @end
 
+@implementation ZeroNativeShortcut
+@end
+
 @implementation ZeroNativeAppKitHost
 
 - (instancetype)initWithAppName:(NSString *)appName windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame {
@@ -286,6 +306,7 @@ static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url)
     self.allowedNavigationOrigins = @[ @"zero://app", @"zero://inline" ];
     self.allowedExternalURLs = @[];
     self.externalLinkAction = 0;
+    self.shortcuts = @[];
     [self configureApplication];
 
     [self createWindowWithId:1 title:(windowTitle.length > 0 ? windowTitle : self.appName) label:self.windowLabel x:x y:y width:width height:height restoreFrame:restoreFrame makeMain:YES];
@@ -1240,24 +1261,24 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
 
 - (BOOL)handleShortcutEvent:(NSEvent *)event {
     if (event.type != NSEventTypeKeyDown) return NO;
-    NSEventModifierFlags flags = event.modifierFlags;
-    if ((flags & NSEventModifierFlagCommand) == 0) return NO;
-    if ((flags & (NSEventModifierFlagControl | NSEventModifierFlagOption)) != 0) return NO;
+    NSString *key = ZeroNativeShortcutKeyForEvent(event);
+    if (key.length == 0) return NO;
+    BOOL usesImplicitShift = ZeroNativeShortcutUsesImplicitShift(key, event);
 
-    NSString *key = event.charactersIgnoringModifiers.lowercaseString ?: @"";
-    NSString *command = nil;
-    if ([key isEqualToString:@"="] || [key isEqualToString:@"+"]) {
-        command = @"zoom-in";
-    } else if ([key isEqualToString:@"-"]) {
-        command = @"zoom-out";
-    } else if ([key isEqualToString:@"0"]) {
-        command = @"zoom-reset";
-    } else if ([key isEqualToString:@"r"]) {
-        command = @"reload";
-    } else {
-        return NO;
+    for (NSUInteger pass = 0; pass < (usesImplicitShift ? 2 : 1); pass++) {
+        BOOL allowImplicitShift = pass == 1;
+        for (ZeroNativeShortcut *shortcut in self.shortcuts) {
+            if (![shortcut.key isEqualToString:key]) continue;
+            if (!ZeroNativeShortcutModifiersMatch(shortcut.modifiers, event.modifierFlags, allowImplicitShift)) continue;
+            [self emitShortcutWithId:shortcut.identifier key:shortcut.key modifiers:shortcut.modifiers event:event];
+            return YES;
+        }
     }
 
+    return NO;
+}
+
+- (void)emitShortcutWithId:(NSString *)identifier key:(NSString *)key modifiers:(uint32_t)modifiers event:(NSEvent *)event {
     uint64_t windowId = 1;
     NSWindow *window = event.window ?: NSApp.keyWindow;
     for (NSNumber *keyValue in self.windows) {
@@ -1266,12 +1287,32 @@ static NSURL *ZeroNativeAssetEntryURL(NSString *origin, NSString *entryPath) {
             break;
         }
     }
-    NSDictionary *detail = @{ @"command": command };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:detail options:0 error:nil];
-    if (!data) return NO;
-    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    [self emitEventNamed:@"shortcut" detailJSON:json ?: @"{}" windowId:windowId];
-    return YES;
+    const char *identifierBytes = identifier.UTF8String ? identifier.UTF8String : "";
+    const char *keyBytes = key.UTF8String ? key.UTF8String : "";
+    [self emitEvent:(zero_native_appkit_event_t){
+        .kind = ZERO_NATIVE_APPKIT_EVENT_SHORTCUT,
+        .window_id = windowId,
+        .shortcut_id = identifierBytes,
+        .shortcut_id_len = [identifier lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+        .shortcut_key = keyBytes,
+        .shortcut_key_len = [key lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+        .shortcut_modifiers = modifiers,
+    }];
+}
+
+- (void)setShortcutsWithIds:(const char *const *)ids idLengths:(const size_t *)idLengths keys:(const char *const *)keys keyLengths:(const size_t *)keyLengths modifiers:(const uint32_t *)modifiers count:(size_t)count {
+    NSMutableArray<ZeroNativeShortcut *> *items = [[NSMutableArray alloc] initWithCapacity:count];
+    for (size_t index = 0; index < count; index++) {
+        NSString *identifier = ids[index] ? [[NSString alloc] initWithBytes:ids[index] length:idLengths[index] encoding:NSUTF8StringEncoding] : @"";
+        NSString *key = keys[index] ? [[NSString alloc] initWithBytes:keys[index] length:keyLengths[index] encoding:NSUTF8StringEncoding] : @"";
+        if (identifier.length == 0 || key.length == 0) continue;
+        ZeroNativeShortcut *shortcut = [[ZeroNativeShortcut alloc] init];
+        shortcut.identifier = identifier;
+        shortcut.key = key.lowercaseString;
+        shortcut.modifiers = modifiers[index];
+        [items addObject:shortcut];
+    }
+    self.shortcuts = items;
 }
 
 - (void)showPreferences:(id)sender {
@@ -1326,6 +1367,70 @@ static NSString *ZeroNativeOriginForURL(NSURL *url) {
     NSNumber *port = url.port;
     if (port) return [NSString stringWithFormat:@"%@://%@:%@", scheme, host, port];
     return [NSString stringWithFormat:@"%@://%@", scheme, host];
+}
+
+static NSString *ZeroNativeShortcutKeyForEvent(NSEvent *event) {
+    NSString *characters = event.charactersIgnoringModifiers ?: @"";
+    if (characters.length == 0) return @"";
+    unichar ch = [characters characterAtIndex:0];
+    switch (ch) {
+        case NSUpArrowFunctionKey: return @"arrowup";
+        case NSDownArrowFunctionKey: return @"arrowdown";
+        case NSLeftArrowFunctionKey: return @"arrowleft";
+        case NSRightArrowFunctionKey: return @"arrowright";
+        case 0x1b: return @"escape";
+        case '\r': return @"enter";
+        case '\t': return @"tab";
+        case NSBackTabCharacter: return @"tab";
+        case ' ': return @"space";
+        case 0x7f: return @"backspace";
+        case '!': return @"1";
+        case '@': return @"2";
+        case '#': return @"3";
+        case '$': return @"4";
+        case '%': return @"5";
+        case '^': return @"6";
+        case '&': return @"7";
+        case '*': return @"8";
+        case '(': return @"9";
+        case ')': return @"0";
+        case '+': return @"=";
+        case '_': return @"-";
+        case '<': return @",";
+        case '>': return @".";
+        case '?': return @"/";
+        case ':': return @";";
+        case '"': return @"'";
+        case '{': return @"[";
+        case '}': return @"]";
+        case '|': return @"\\";
+        case '~': return @"`";
+        default: return characters.lowercaseString;
+    }
+}
+
+static BOOL ZeroNativeShortcutUsesImplicitShift(NSString *key, NSEvent *event) {
+    if ((event.modifierFlags & NSEventModifierFlagShift) == 0) return NO;
+    if (key.length != 1) return NO;
+    unichar ch = [key characterAtIndex:0];
+    return (ch >= '0' && ch <= '9') ||
+        ch == '=' || ch == '-' || ch == ',' ||
+        ch == '.' || ch == '/' || ch == ';' || ch == '\'' ||
+        ch == '[' || ch == ']' || ch == '\\' || ch == '`';
+}
+
+static BOOL ZeroNativeShortcutModifiersMatch(uint32_t shortcutModifiers, NSEventModifierFlags eventModifiers, BOOL allowImplicitShift) {
+    NSEventModifierFlags flags = eventModifiers & NSEventModifierFlagDeviceIndependentFlagsMask;
+    BOOL needsCommand = (shortcutModifiers & ZeroNativeShortcutModifierCommand) != 0 || (shortcutModifiers & ZeroNativeShortcutModifierPrimary) != 0;
+    BOOL needsControl = (shortcutModifiers & ZeroNativeShortcutModifierControl) != 0;
+    BOOL needsOption = (shortcutModifiers & ZeroNativeShortcutModifierOption) != 0;
+    BOOL needsShift = (shortcutModifiers & ZeroNativeShortcutModifierShift) != 0;
+    BOOL hasCommand = (flags & NSEventModifierFlagCommand) != 0;
+    BOOL hasControl = (flags & NSEventModifierFlagControl) != 0;
+    BOOL hasOption = (flags & NSEventModifierFlagOption) != 0;
+    BOOL hasShift = (flags & NSEventModifierFlagShift) != 0;
+    BOOL shiftMatches = needsShift ? hasShift : (!hasShift || allowImplicitShift);
+    return hasCommand == needsCommand && hasControl == needsControl && hasOption == needsOption && shiftMatches;
 }
 
 static BOOL ZeroNativePolicyListMatches(NSArray<NSString *> *values, NSURL *url) {
@@ -1426,6 +1531,11 @@ void zero_native_appkit_set_security_policy(zero_native_appkit_host_t *host, con
     NSArray<NSString *> *origins = ZeroNativePolicyListFromBytes(allowed_origins, allowed_origins_len, @[ @"zero://app", @"zero://inline" ]);
     NSArray<NSString *> *externalURLs = ZeroNativePolicyListFromBytes(external_urls, external_urls_len, @[]);
     [object setAllowedNavigationOrigins:origins externalURLs:externalURLs externalAction:external_action];
+}
+
+void zero_native_appkit_set_shortcuts(zero_native_appkit_host_t *host, const char *const *ids, const size_t *id_lens, const char *const *keys, const size_t *key_lens, const uint32_t *modifiers, size_t count) {
+    ZeroNativeAppKitHost *object = (__bridge ZeroNativeAppKitHost *)host;
+    [object setShortcutsWithIds:ids idLengths:id_lens keys:keys keyLengths:key_lens modifiers:modifiers count:count];
 }
 
 int zero_native_appkit_create_window(zero_native_appkit_host_t *host, uint64_t window_id, const char *window_title, size_t window_title_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame) {
