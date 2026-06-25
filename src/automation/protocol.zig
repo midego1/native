@@ -11,6 +11,7 @@ pub const Error = error{
 pub const Action = enum {
     reload,
     wait,
+    resize,
     bridge,
     native_command,
     menu_command,
@@ -29,6 +30,7 @@ pub const Command = struct {
         const value = if (separator) |index| std.mem.trim(u8, trimmed[index + 1 ..], " \n\r\t") else "";
         if (std.mem.eql(u8, action_text, "reload")) return .{ .action = .reload };
         if (std.mem.eql(u8, action_text, "wait")) return .{ .action = .wait, .value = value };
+        if (std.mem.eql(u8, action_text, "resize") and value.len > 0) return .{ .action = .resize, .value = value };
         if (std.mem.eql(u8, action_text, "bridge") and value.len > 0) return .{ .action = .bridge, .value = value };
         if (std.mem.eql(u8, action_text, "native-command") and value.len > 0) return .{ .action = .native_command, .value = value };
         if (std.mem.eql(u8, action_text, "menu-command") and value.len > 0) return .{ .action = .menu_command, .value = value };
@@ -55,6 +57,9 @@ test "commands parse reload and wait" {
     const bridge = try Command.parse("bridge {\"id\":\"1\",\"command\":\"native.ping\",\"payload\":{\"source\":\"smoke test\"}}");
     try std.testing.expectEqual(Action.bridge, bridge.action);
     try std.testing.expectEqualStrings("{\"id\":\"1\",\"command\":\"native.ping\",\"payload\":{\"source\":\"smoke test\"}}", bridge.value);
+    const resize = try Command.parse("resize 900 640");
+    try std.testing.expectEqual(Action.resize, resize.action);
+    try std.testing.expectEqualStrings("900 640", resize.value);
     const native_command = try Command.parse("native-command app.refresh refresh-button");
     try std.testing.expectEqual(Action.native_command, native_command.action);
     try std.testing.expectEqualStrings("app.refresh refresh-button", native_command.value);

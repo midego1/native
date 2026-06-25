@@ -983,6 +983,14 @@ pub const Runtime = struct {
             .bridge => {
                 try self.handleBridgeMessage(app, .{ .bytes = command.value, .origin = "zero://inline", .window_id = 1, .webview_label = "main" });
             },
+            .resize => {
+                const parsed = try parseAutomationResizeCommand(command.value);
+                try self.dispatchPlatformEvent(app, .{ .surface_resized = .{
+                    .id = 1,
+                    .size = geometry.SizeF.init(parsed.width, parsed.height),
+                    .scale_factor = parsed.scale_factor,
+                } });
+            },
             .native_command => {
                 const parsed = try parseAutomationNativeCommand(command.value);
                 try self.dispatchPlatformEvent(app, .{ .native_command = .{
@@ -3073,6 +3081,12 @@ const AutomationNativeCommand = struct {
     view_label: []const u8 = "",
 };
 
+const AutomationResizeCommand = struct {
+    width: f32,
+    height: f32,
+    scale_factor: f32 = 1,
+};
+
 fn parseAutomationCommandName(value: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, value, " \n\r\t");
     if (trimmed.len == 0) return error.InvalidCommand;
@@ -3089,6 +3103,40 @@ fn parseAutomationNativeCommand(value: []const u8) !AutomationNativeCommand {
         .name = trimmed[0..separator],
         .view_label = view_label,
     };
+}
+
+fn parseAutomationResizeCommand(value: []const u8) !AutomationResizeCommand {
+    var parts = std.mem.tokenizeAny(u8, value, " \n\r\t");
+    const width_bytes = parts.next() orelse return error.InvalidCommand;
+    const height_bytes = parts.next() orelse return error.InvalidCommand;
+    const scale_bytes = parts.next();
+    if (parts.next() != null) return error.InvalidCommand;
+    const width = std.fmt.parseFloat(f32, width_bytes) catch return error.InvalidCommand;
+    const height = std.fmt.parseFloat(f32, height_bytes) catch return error.InvalidCommand;
+    const scale_factor = if (scale_bytes) |bytes| std.fmt.parseFloat(f32, bytes) catch return error.InvalidCommand else 1;
+    if (!std.math.isFinite(width) or !std.math.isFinite(height) or !std.math.isFinite(scale_factor)) return error.InvalidCommand;
+    if (width <= 0 or height <= 0 or scale_factor <= 0) return error.InvalidCommand;
+    return .{
+        .width = width,
+        .height = height,
+        .scale_factor = scale_factor,
+    };
+}
+
+test "runtime parses automation resize commands" {
+    const resize = try parseAutomationResizeCommand("900 640");
+    try std.testing.expectEqual(@as(f32, 900), resize.width);
+    try std.testing.expectEqual(@as(f32, 640), resize.height);
+    try std.testing.expectEqual(@as(f32, 1), resize.scale_factor);
+
+    const scaled = try parseAutomationResizeCommand("900 640 2");
+    try std.testing.expectEqual(@as(f32, 2), scaled.scale_factor);
+
+    try std.testing.expectError(error.InvalidCommand, parseAutomationResizeCommand(""));
+    try std.testing.expectError(error.InvalidCommand, parseAutomationResizeCommand("900"));
+    try std.testing.expectError(error.InvalidCommand, parseAutomationResizeCommand("0 640"));
+    try std.testing.expectError(error.InvalidCommand, parseAutomationResizeCommand("900 nan"));
+    try std.testing.expectError(error.InvalidCommand, parseAutomationResizeCommand("900 640 1 2"));
 }
 
 fn validateCommandName(name: []const u8) !void {

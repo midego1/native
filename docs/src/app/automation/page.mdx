@@ -82,6 +82,10 @@ The runtime polls `command.txt` and processes these actions:
       <td>Block until the snapshot shows <code>ready=true</code></td>
     </tr>
     <tr>
+      <td><code>resize &lt;width&gt; &lt;height&gt; [&lt;scale&gt;]</code></td>
+      <td>Dispatch a main-window resize event and relayout native/WebView surfaces</td>
+    </tr>
+    <tr>
       <td><code>bridge &lt;json&gt;</code></td>
       <td>Send a bridge command with origin <code>zero://inline</code></td>
     </tr>
@@ -122,6 +126,9 @@ zero-native automate screenshot
 # Reload the WebView
 zero-native automate reload
 
+# Resize the main window surface
+zero-native automate resize 900 640
+
 # Send a bridge command and get the response
 zero-native automate bridge '{"id":"1","command":"native.ping","payload":{"source":"automation"}}'
 ```
@@ -133,8 +140,8 @@ The WebView and native-shell smoke build steps demonstrate full automation test 
 1. Build and start the app with `-Dautomation=true`
 2. Run `zero-native automate wait` to block until the app is ready
 3. Run `zero-native automate snapshot` to verify window, source, and native/WebView metadata
-4. Run `zero-native automate bridge '...'` or write command-source actions to `command.txt`
-5. Verify bridge responses and updated snapshots
+4. Run `zero-native automate resize ...`, `zero-native automate bridge '...'`, or write command-source actions to `command.txt`
+5. Verify bridge responses, relayout bounds, and updated snapshots
 
 ```bash
 zig build test-webview-smoke -Dplatform=macos
