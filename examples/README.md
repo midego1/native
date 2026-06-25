@@ -4,9 +4,10 @@ Use these examples as a progressive path through zero-native:
 
 - `hello` is the smallest desktop shell with inline HTML.
 - `webview` demonstrates bridge commands, built-in window APIs, security policy, automation, and optional CEF.
+- `command-app` demonstrates one command handled from a native toolbar button, native menu item, app shortcut, and WebView bridge call.
 - `native-shell` demonstrates native toolbar/sidebar/statusbar views with a WebView content area.
 - `browser` is a vanilla no-build shell that uses layered WebViews for isolated page content on macOS and Linux system WebViews.
 - `react`, `svelte`, `vue`, and `next` show framework projects with managed frontend assets and dev-server workflows.
 - `ios` and `android` show how mobile hosts link the zero-native C ABI from `libzero-native.a`.
 
-Start with `hello`, then move to `webview` when you need native commands or WebView policy. Use `native-shell` when you want native app chrome around web content, `browser` when you want to see layered native WebViews, and a framework example when building a real frontend.
+Start with `hello`, then move to `webview` when you need native commands or WebView policy. Use `command-app` when command routing needs to span native and web entry points, `native-shell` when you want native app chrome around web content, `browser` when you want to see layered native WebViews, and a framework example when building a real frontend.
