@@ -23,9 +23,12 @@ The default test suite does not require a window server:
 zig build test
 zig build test-desktop
 zig build test-platform-info
+zig build test-examples-native
 ```
 
 Bridge and IPC coverage lives in the headless desktop tests: they inject platform bridge events, exercise command policy and handlers, and assert the platform response without launching a WebView.
+
+`test-examples-native` runs the headless tests for `examples/command-app`, `examples/native-shell`, `examples/native-panels`, and `examples/capabilities` with `-Dplatform=null`. This keeps command routing, native view composition, and guarded OS capability examples covered from the repository root.
 
 ## WebView smoke tests
 

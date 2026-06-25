@@ -22,3 +22,9 @@ Run the headless test path:
 ```sh
 zig build test -Dplatform=null
 ```
+
+Run all native-first example tests from the repository root:
+
+```sh
+zig build test-examples-native
+```
