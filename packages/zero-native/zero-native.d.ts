@@ -304,6 +304,13 @@ export interface ZeroNativeCommandEvent {
   trayItemId: number;
 }
 
+export interface ZeroNativeCommandInfo {
+  id: string;
+  title: string;
+  enabled: boolean;
+  checked: boolean;
+}
+
 export interface ZeroNativeCommandSelector {
   name?: string;
   id?: string;
@@ -410,6 +417,7 @@ export interface ZeroNativeApi {
   /** Dispatch an app command through the runtime command path. */
   commands: {
     invoke(command: string | ZeroNativeCommandSelector): Promise<ZeroNativeCommandEvent>;
+    list(): Promise<ZeroNativeCommandInfo[]>;
   };
   windows: {
     create(options?: ZeroNativeCreateWindowOptions): Promise<ZeroNativeWindowInfo>;
