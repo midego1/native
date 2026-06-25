@@ -157,6 +157,14 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = statusbar_height, .layer = 20, .role = "Status" },
     .{ .label = "status-label", .kind = .label, .parent = "statusbar", .x = 16, .y = 11, .width = 520, .height = 18, .layer = 21, .text = "Ready. Press Cmd-R or use the WebView button." },
 };
+const shell_windows = [_]zero_native.ShellWindow{.{
+    .label = "main",
+    .title = "zero-native Native Shell",
+    .width = window_width,
+    .height = window_height,
+    .views = &shell_views,
+}};
+const shell_scene: zero_native.ShellConfig = .{ .windows = &shell_windows };
 
 const NativeShellApp = struct {
     refresh_count: u32 = 0,
@@ -167,14 +175,14 @@ const NativeShellApp = struct {
             .context = self,
             .name = "native-shell",
             .source = zero_native.WebViewSource.html(html),
-            .start_fn = start,
+            .scene_fn = scene,
             .event_fn = event,
         };
     }
 
-    fn start(context: *anyopaque, runtime: *zero_native.Runtime) anyerror!void {
+    fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
         _ = context;
-        try runtime.createShellViews(1, &shell_views, zero_native.geometry.RectF.init(0, 0, window_width, window_height));
+        return shell_scene;
     }
 
     fn event(context: *anyopaque, runtime: *zero_native.Runtime, event_value: zero_native.Event) anyerror!void {

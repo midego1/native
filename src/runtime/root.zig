@@ -83,13 +83,15 @@ pub const Event = union(enum) {
 const StartFn = *const fn (context: *anyopaque, runtime: *Runtime) anyerror!void;
 const EventFn = *const fn (context: *anyopaque, runtime: *Runtime, event: Event) anyerror!void;
 const SourceFn = *const fn (context: *anyopaque) anyerror!platform.WebViewSource;
+const SceneFn = *const fn (context: *anyopaque) anyerror!app_manifest.ShellConfig;
 const StopFn = *const fn (context: *anyopaque, runtime: *Runtime) anyerror!void;
 
 pub const App = struct {
     context: *anyopaque,
     name: []const u8,
-    source: platform.WebViewSource,
+    source: platform.WebViewSource = platform.WebViewSource.html(""),
     source_fn: ?SourceFn = null,
+    scene_fn: ?SceneFn = null,
     start_fn: ?StartFn = null,
     event_fn: ?EventFn = null,
     stop_fn: ?StopFn = null,
@@ -105,6 +107,11 @@ pub const App = struct {
     pub fn webViewSource(self: App) anyerror!platform.WebViewSource {
         if (self.source_fn) |source_fn| return source_fn(self.context);
         return self.source;
+    }
+
+    pub fn scene(self: App) anyerror!?app_manifest.ShellConfig {
+        if (self.scene_fn) |scene_fn| return try scene_fn(self.context);
+        return null;
     }
 
     pub fn stop(self: App, runtime: *Runtime) anyerror!void {
@@ -541,7 +548,11 @@ pub const Runtime = struct {
                 try app.start(self);
                 if (self.options.extensions) |registry| try registry.startAll(self.extensionContext());
                 try self.dispatchEvent(app, .{ .lifecycle = .start });
-                try self.loadStartupWindows(app);
+                if (try app.scene()) |scene| {
+                    try self.loadScene(app, scene);
+                } else {
+                    try self.loadStartupWindows(app);
+                }
                 self.invalidateFor(.startup, null);
                 try self.log("app.start", "app started", &.{trace.string("app", app.name)});
             },
@@ -760,6 +771,62 @@ pub const Runtime = struct {
             trace.string("kind", @tagName(source.kind)),
             trace.uint("bytes", source.bytes.len),
         });
+    }
+
+    fn loadScene(self: *Runtime, app: App, scene: app_manifest.ShellConfig) anyerror!void {
+        try app_manifest.validateShell(scene, &.{});
+        if (scene.windows.len == 0) {
+            try self.log("scene.load", "loaded empty app scene", &.{trace.string("app", app.name)});
+            return;
+        }
+
+        const source = try app.webViewSource();
+        self.loaded_source = source;
+
+        try self.loadStartupSceneWindow(scene.windows[0], source);
+        for (scene.windows[1..]) |window| {
+            _ = try self.createShellWindow(window, source);
+        }
+
+        try self.log("scene.load", "loaded app scene", &.{
+            trace.string("app", app.name),
+            trace.uint("windows", scene.windows.len),
+        });
+    }
+
+    fn loadStartupSceneWindow(self: *Runtime, shell_window: app_manifest.ShellWindow, source: platform.WebViewSource) anyerror!void {
+        const app_info = self.options.platform.app_info;
+        const startup_window = app_info.resolvedStartupWindow(0);
+        const window_id = startup_window.id;
+        const frame_value = geometry.RectF.init(
+            shell_window.x orelse 0,
+            shell_window.y orelse 0,
+            shell_window.width,
+            shell_window.height,
+        );
+
+        const runtime_index = if (self.findWindowIndexById(window_id)) |index| index else try self.reserveWindow(
+            window_id,
+            shell_window.label,
+            shell_window.title orelse app_info.resolvedWindowTitle(),
+            null,
+        );
+        if (self.findWindowIndexByLabel(shell_window.label)) |label_index| {
+            if (label_index != runtime_index) return error.DuplicateWindowLabel;
+        }
+
+        self.windows[runtime_index].info.label = try copyInto(&self.windows[runtime_index].label_storage, shell_window.label);
+        self.windows[runtime_index].info.title = try copyInto(&self.windows[runtime_index].title_storage, shell_window.title orelse app_info.resolvedWindowTitle());
+        self.windows[runtime_index].info.frame = frame_value;
+        self.windows[runtime_index].source = try self.copySource(runtime_index, source);
+        if (!self.windows[runtime_index].main_frame_set) {
+            self.windows[runtime_index].main_frame = geometry.RectF.init(0, 0, frame_value.width, frame_value.height);
+        }
+        self.next_window_id = @max(self.next_window_id, window_id + 1);
+
+        try self.options.platform.services.loadWindowWebView(window_id, source);
+        try self.applyMainWebViewState(window_id);
+        try self.createShellViews(window_id, shell_window.views, frame_value);
     }
 
     fn applyMainWebViewState(self: *Runtime, window_id: platform.WindowId) anyerror!void {
@@ -3324,6 +3391,80 @@ test "runtime relayouts shell views attached to startup window" {
     try std.testing.expectEqual(@as(f32, 470), statusbar.frame.y);
     try std.testing.expectEqual(@as(f32, 900), main.frame.width);
     try std.testing.expectEqual(@as(f32, 420), main.frame.height);
+}
+
+test "runtime loads scene hook as native shell startup" {
+    const TestApp = struct {
+        const scene_views = [_]app_manifest.ShellView{
+            .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 48, .role = "Toolbar" },
+            .{ .label = "refresh", .kind = .button, .parent = "toolbar", .text = "Refresh", .command = "app.refresh" },
+            .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
+            .{ .label = "status", .kind = .statusbar, .edge = .bottom, .height = 28, .text = "Ready" },
+        };
+        const scene_windows = [_]app_manifest.ShellWindow{.{
+            .label = "main",
+            .title = "Scene Shell",
+            .width = 900,
+            .height = 600,
+            .views = &scene_views,
+        }};
+
+        scene_called: bool = false,
+        source_called_after_scene: bool = false,
+
+        fn scene(context: *anyopaque) anyerror!app_manifest.ShellConfig {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.scene_called = true;
+            return .{ .windows = &scene_windows };
+        }
+
+        fn source(context: *anyopaque) anyerror!platform.WebViewSource {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.source_called_after_scene = self.scene_called;
+            return platform.WebViewSource.html("<h1>Scene content</h1>");
+        }
+
+        fn app(self: *@This()) App {
+            return .{
+                .context = self,
+                .name = "scene-shell",
+                .source_fn = source,
+                .scene_fn = scene,
+            };
+        }
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{ .id = 1, .size = geometry.SizeF.init(900, 600) });
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+
+    try std.testing.expect(app_state.scene_called);
+    try std.testing.expect(app_state.source_called_after_scene);
+    try std.testing.expectEqualStrings("<h1>Scene content</h1>", harness.null_platform.loaded_source.?.bytes);
+
+    var windows_buffer: [2]platform.WindowInfo = undefined;
+    const windows = harness.runtime.listWindows(&windows_buffer);
+    try std.testing.expectEqual(@as(usize, 1), windows.len);
+    try std.testing.expectEqualStrings("main", windows[0].label);
+    try std.testing.expectEqualStrings("Scene Shell", windows[0].title);
+
+    var views_buffer: [8]platform.ViewInfo = undefined;
+    const views = harness.runtime.listViews(1, &views_buffer);
+    const toolbar = testViewByLabel(views, "toolbar").?;
+    const refresh = testViewByLabel(views, "refresh").?;
+    const main = testViewByLabel(views, "main").?;
+    const status = testViewByLabel(views, "status").?;
+
+    try std.testing.expectEqual(platform.ViewKind.toolbar, toolbar.kind);
+    try std.testing.expectEqualStrings("Toolbar", toolbar.role);
+    try std.testing.expectEqual(platform.ViewKind.button, refresh.kind);
+    try std.testing.expectEqualStrings("app.refresh", refresh.command);
+    try std.testing.expectEqual(platform.ViewKind.webview, main.kind);
+    try std.testing.expectEqual(@as(f32, 48), main.frame.y);
+    try std.testing.expectEqual(@as(f32, 524), main.frame.height);
+    try std.testing.expectEqual(platform.ViewKind.statusbar, status.kind);
+    try std.testing.expectEqualStrings("Ready", status.text);
 }
 
 test "runtime automation snapshot includes generic views" {

@@ -1,6 +1,6 @@
 # Native Controls
 
-Native controls are platform-owned views created through `runtime.createView(...)`, `runtime.createShellViews(...)`, or the guarded `window.zero.views.*` bridge helpers. They are intended for trusted chrome, utility panels, and OS-native affordances around rich WebView content.
+Native controls are platform-owned views declared with `App.scene_fn`, attached with `runtime.createShellViews(...)`, created imperatively through `runtime.createView(...)`, or created from trusted WebView code through the guarded `window.zero.views.*` bridge helpers. They are intended for trusted chrome, utility panels, and OS-native affordances around rich WebView content.
 
 ```zig
 const shell_views = [_]zero_native.ShellView{
@@ -12,7 +12,18 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
 };
 
-try runtime.createShellViews(1, &shell_views, zero_native.geometry.RectF.init(0, 0, 1100, 760));
+const shell_windows = [_]zero_native.ShellWindow{.{
+    .label = "main",
+    .title = "Acme",
+    .width = 1100,
+    .height = 760,
+    .views = &shell_views,
+}};
+
+fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
+    _ = context;
+    return .{ .windows = &shell_windows };
+}
 ```
 
 ## Supported Kinds

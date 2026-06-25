@@ -139,7 +139,7 @@ The `app.zon` manifest declares app metadata, permissions, bridge policies, secu
 
 The optional `shell` block declares native-first windows with explicit view trees. Existing `windows` entries remain the simple compatibility path; `shell.windows` is the richer contract for native chrome, native controls, WebViews, and future GPU surfaces.
 
-Tooling parses and validates the schema. Runtime code can materialize a parsed shell window with `runtime.createShellWindow(...)` or attach a shell view list to an existing window with `runtime.createShellViews(...)`; platform hosts implement view kinds progressively, so unsupported native kinds fail at runtime with an explicit unsupported error until that backend grows support.
+Tooling parses and validates the schema. Runtime code can return the same shape from `App.scene_fn`, materialize a parsed shell window with `runtime.createShellWindow(...)`, or attach a shell view list to an existing window with `runtime.createShellViews(...)`; platform hosts implement view kinds progressively, so unsupported native kinds fail at runtime with an explicit unsupported error until that backend grows support.
 
 ```zig
 .shell = .{
