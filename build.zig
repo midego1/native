@@ -193,6 +193,10 @@ pub fn build(b: *std.Build) void {
         .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"gpu_surfaces\"" },
         .{ .path = "packages/zero-native/zero-native.d.ts", .pattern = "\"gpuSurfaces\"" },
     });
+    addFileContainsCheckStep(b, test_step, "test-docs-command-contracts", "Verify command docs match native view update contracts", &.{
+        .{ .path = "docs/src/app/commands/page.mdx", .pattern = ".text = \"Refreshed\"" },
+        .{ .path = "docs/src/app/commands/page.mdx", .pattern = "const commands = await window.zero.commands.list();" },
+    });
 
     addTestStep(b, "test-geometry", "Run geometry module tests", geometry_tests);
     addTestStep(b, "test-assets", "Run assets module tests", assets_tests);

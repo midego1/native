@@ -9,7 +9,7 @@ fn event(context: *anyopaque, runtime: *zero_native.Runtime, event_value: zero_n
         .command => |command| {
             if (std.mem.eql(u8, command.name, "app.refresh")) {
                 try runtime.updateView(command.window_id, "status", .{
-                    .role = "Refreshed",
+                    .text = "Refreshed",
                 });
             }
         },
