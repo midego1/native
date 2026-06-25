@@ -117,6 +117,7 @@ pub const CapabilityKind = enum {
     filesystem,
     network,
     notifications,
+    dialog,
     clipboard,
     credentials,
     custom,
@@ -129,6 +130,7 @@ pub const Capability = union(CapabilityKind) {
     filesystem: void,
     network: void,
     notifications: void,
+    dialog: void,
     clipboard: void,
     credentials: void,
     custom: []const u8,
@@ -1319,7 +1321,7 @@ test "platform validation catches duplicates and invalid overrides" {
 }
 
 test "capability validation catches duplicates and invalid custom names" {
-    try validateCapabilities(&.{ .native_module, .webview, .notifications, .credentials, .{ .custom = "com.example.native-camera" } });
+    try validateCapabilities(&.{ .native_module, .webview, .notifications, .dialog, .credentials, .{ .custom = "com.example.native-camera" } });
     try std.testing.expectError(error.DuplicateCapability, validateCapabilities(&.{ .webview, .webview }));
     try std.testing.expectError(error.DuplicateCapability, validateCapabilities(&.{ .{ .custom = "custom" }, .{ .custom = "custom" } }));
     try std.testing.expectError(error.InvalidName, validateCapabilities(&.{.{ .custom = "bad/name" }}));

@@ -691,6 +691,7 @@ fn parseCapability(value: []const u8) !app_manifest.Capability {
     if (std.mem.eql(u8, value, "filesystem")) return .filesystem;
     if (std.mem.eql(u8, value, "network")) return .network;
     if (std.mem.eql(u8, value, "notifications")) return .notifications;
+    if (std.mem.eql(u8, value, "dialog")) return .dialog;
     if (std.mem.eql(u8, value, "clipboard")) return .clipboard;
     if (std.mem.eql(u8, value, "credentials")) return .credentials;
     return error.InvalidCapability;
@@ -888,7 +889,7 @@ test "manifest metadata parser reads identity version and lists" {
         \\  .version = "1.2.3",
         \\  .icons = .{ "assets/icon.png" },
         \\  .platforms = .{ "macos", "linux" },
-        \\  .capabilities = .{ "native_module", "webview", "js_bridge", "credentials" },
+        \\  .capabilities = .{ "native_module", "webview", "js_bridge", "dialog", "credentials" },
         \\  .bridge = .{ .commands = .{ .{ .name = "native.ping" } } },
         \\  .web_engine = "chromium",
         \\  .cef = .{ .dir = "third_party/cef/macos", .auto_install = true },
@@ -912,7 +913,8 @@ test "manifest metadata parser reads identity version and lists" {
     try std.testing.expectEqualStrings("assets/icon.png", metadata.icons[0]);
     try std.testing.expectEqualStrings("linux", metadata.platforms[1]);
     try std.testing.expectEqualStrings("webview", metadata.capabilities[1]);
-    try std.testing.expectEqualStrings("credentials", metadata.capabilities[3]);
+    try std.testing.expectEqualStrings("dialog", metadata.capabilities[3]);
+    try std.testing.expectEqualStrings("credentials", metadata.capabilities[4]);
     try std.testing.expectEqualStrings("native.ping", metadata.bridge_commands[0].name);
     try std.testing.expectEqualStrings("command.palette", metadata.shortcuts[0].id);
     try std.testing.expectEqualStrings("primary", metadata.shortcuts[0].modifiers[0]);
