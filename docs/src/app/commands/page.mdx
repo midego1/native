@@ -61,6 +61,18 @@ The same command can be bound to a menu item, shortcut, toolbar button, tray ite
 
 This metadata gives native and web entry points a common manifest-level command catalog while runtime dispatch still happens through `Event.command`.
 
+Generated runners load that catalog into runtime options. Native code can read the active commands without reparsing the manifest:
+
+```zig
+var buffer: [32]zero_native.Command = undefined;
+const commands = runtime.listCommands(&buffer);
+for (commands) |command| {
+    if (command.enabled) {
+        // Bind command.id to native controls or custom UI.
+    }
+}
+```
+
 ## Bridge invocation
 
 When `js_window_api` and the built-in bridge policy allow it, WebView content can dispatch the same command:

@@ -30,12 +30,7 @@ pub const CommandEvent = struct {
     tray_item_id: platform.TrayItemId = 0,
 };
 
-pub const Command = struct {
-    id: []const u8,
-    title: []const u8 = "",
-    enabled: bool = true,
-    checked: bool = false,
-};
+pub const Command = app_manifest.Command;
 
 pub const CommandSource = enum {
     runtime,
@@ -127,6 +122,7 @@ pub const Options = struct {
     bridge: ?bridge.Dispatcher = null,
     builtin_bridge: bridge.Policy = .{},
     security: security.Policy = .{},
+    commands: []const Command = &.{},
     menus: []const platform.Menu = &.{},
     shortcuts: []const platform.Shortcut = &.{},
     automation: ?automation.Server = null,
@@ -197,6 +193,7 @@ pub const Runtime = struct {
             init_field_count += 1;
         }
         try self.log("runtime.init", "runtime initialized", init_fields[0..init_field_count]);
+        try app_manifest.validateCommands(self.options.commands);
         try self.options.platform.services.configureSecurityPolicy(self.options.security);
         try self.options.platform.services.configureMenus(self.options.menus);
         try self.options.platform.services.configureShortcuts(self.options.shortcuts);
@@ -263,6 +260,14 @@ pub const Runtime = struct {
         self.removeViewsForWindow(window_id);
         self.removeWebViewsForWindow(window_id);
         self.invalidated = true;
+    }
+
+    pub fn listCommands(self: *const Runtime, output: []Command) []const Command {
+        const count = @min(output.len, self.options.commands.len);
+        for (self.options.commands[0..count], 0..) |command, index| {
+            output[index] = command;
+        }
+        return output[0..count];
     }
 
     pub fn createShellWindow(self: *Runtime, shell_window: app_manifest.ShellWindow, source: ?platform.WebViewSource) anyerror!platform.WindowInfo {
@@ -4043,6 +4048,25 @@ test "runtime rejects invalid keyboard shortcuts" {
     try std.testing.expectError(error.InvalidShortcut, harness.runtime.run(app_state.app()));
 }
 
+test "runtime rejects invalid command catalog" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "invalid-commands", .source = platform.WebViewSource.html("<h1>Commands</h1>") };
+        }
+    };
+
+    const commands = [_]Command{
+        .{ .id = "app.refresh", .title = "Refresh" },
+        .{ .id = "app.refresh", .title = "Duplicate Refresh" },
+    };
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.commands = &commands;
+    var app_state: TestApp = .{};
+
+    try std.testing.expectError(error.DuplicateCommand, harness.runtime.run(app_state.app()));
+}
+
 test "runtime rejects oversized webview source" {
     const TestApp = struct {
         bytes: [platform.max_window_source_bytes + 1]u8 = [_]u8{'x'} ** (platform.max_window_source_bytes + 1),
@@ -4530,6 +4554,30 @@ test "runtime dispatches native view command events" {
     try std.testing.expectEqual(@as(u32, 2), app_state.command_count);
     try std.testing.expectEqual(CommandSource.toolbar, app_state.last_source);
     try std.testing.expectEqualStrings("toolbar-refresh", app_state.last_view_label);
+}
+
+test "runtime exposes configured command catalog" {
+    const commands = [_]Command{
+        .{ .id = "app.refresh", .title = "Refresh" },
+        .{ .id = "app.sidebar.toggle", .title = "Sidebar", .checked = true },
+    };
+    var harness: TestHarness() = undefined;
+    harness.init(.{});
+    harness.runtime.options.commands = &commands;
+
+    var output: [4]Command = undefined;
+    const listed = harness.runtime.listCommands(&output);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+    try std.testing.expectEqualStrings("app.refresh", listed[0].id);
+    try std.testing.expectEqualStrings("Refresh", listed[0].title);
+    try std.testing.expect(listed[0].enabled);
+    try std.testing.expectEqualStrings("app.sidebar.toggle", listed[1].id);
+    try std.testing.expect(listed[1].checked);
+
+    var narrow_output: [1]Command = undefined;
+    const narrow = harness.runtime.listCommands(&narrow_output);
+    try std.testing.expectEqual(@as(usize, 1), narrow.len);
+    try std.testing.expectEqualStrings("app.refresh", narrow[0].id);
 }
 
 test "runtime dispatches menu command events" {

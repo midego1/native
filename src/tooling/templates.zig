@@ -721,6 +721,7 @@ fn runnerZig() []const u8 {
     \\const build_options = @import("build_options");
     \\const zero_native = @import("zero-native");
     \\const app_manifest = @import("app_manifest_zon");
+    \\const manifest_commands = if (@hasField(@TypeOf(app_manifest), "commands")) app_manifest.commands else .{};
     \\const manifest_shortcuts = if (@hasField(@TypeOf(app_manifest), "shortcuts")) app_manifest.shortcuts else .{};
     \\const manifest_menus = if (@hasField(@TypeOf(app_manifest), "menus")) app_manifest.menus else .{};
     \\
@@ -748,6 +749,7 @@ fn runnerZig() []const u8 {
     \\    builtin_bridge: zero_native.BridgePolicy = .{},
     \\    security: zero_native.SecurityPolicy = .{},
     \\    js_window_api: bool = false,
+    \\    commands: ?[]const zero_native.Command = null,
     \\    menus: ?[]const zero_native.Menu = null,
     \\    shortcuts: ?[]const zero_native.Shortcut = null,
     \\
@@ -764,8 +766,34 @@ fn runnerZig() []const u8 {
     \\        return self.shortcuts orelse storage.fromManifest();
     \\    }
     \\
+    \\    fn resolvedCommands(self: RunOptions, storage: *CommandStorage) []const zero_native.Command {
+    \\        return self.commands orelse storage.fromManifest();
+    \\    }
+    \\
     \\    fn resolvedMenus(self: RunOptions, storage: *MenuStorage) []const zero_native.Menu {
     \\        return self.menus orelse storage.fromManifest();
+    \\    }
+    \\};
+    \\
+    \\const CommandStorage = struct {
+    \\    commands: [zero_native.app_manifest.max_commands]zero_native.Command = undefined,
+    \\
+    \\    fn fromManifest(self: *CommandStorage) []const zero_native.Command {
+    \\        comptime {
+    \\            if (manifest_commands.len > zero_native.app_manifest.max_commands) {
+    \\                @compileError("app.zon defines too many commands");
+    \\            }
+    \\        }
+    \\
+    \\        inline for (manifest_commands, 0..) |command, index| {
+    \\            self.commands[index] = .{
+    \\                .id = command.id,
+    \\                .title = if (@hasField(@TypeOf(command), "title")) command.title else "",
+    \\                .enabled = if (@hasField(@TypeOf(command), "enabled")) command.enabled else true,
+    \\                .checked = if (@hasField(@TypeOf(command), "checked")) command.checked else false,
+    \\            };
+    \\        }
+    \\        return self.commands[0..manifest_commands.len];
     \\    }
     \\};
     \\
@@ -898,6 +926,8 @@ fn runnerZig() []const u8 {
     \\    const shortcuts = options.resolvedShortcuts(&shortcut_storage);
     \\    var menu_storage: MenuStorage = .{};
     \\    const menus = options.resolvedMenus(&menu_storage);
+    \\    var command_storage: CommandStorage = .{};
+    \\    const commands = options.resolvedCommands(&command_storage);
     \\    var runtime = zero_native.Runtime.init(.{
     \\        .platform = null_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
@@ -906,6 +936,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
     \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
@@ -939,6 +970,8 @@ fn runnerZig() []const u8 {
     \\    const shortcuts = options.resolvedShortcuts(&shortcut_storage);
     \\    var menu_storage: MenuStorage = .{};
     \\    const menus = options.resolvedMenus(&menu_storage);
+    \\    var command_storage: CommandStorage = .{};
+    \\    const commands = options.resolvedCommands(&command_storage);
     \\    var runtime = zero_native.Runtime.init(.{
     \\        .platform = mac_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
@@ -947,6 +980,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
     \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
@@ -980,6 +1014,8 @@ fn runnerZig() []const u8 {
     \\    const shortcuts = options.resolvedShortcuts(&shortcut_storage);
     \\    var menu_storage: MenuStorage = .{};
     \\    const menus = options.resolvedMenus(&menu_storage);
+    \\    var command_storage: CommandStorage = .{};
+    \\    const commands = options.resolvedCommands(&command_storage);
     \\    var runtime = zero_native.Runtime.init(.{
     \\        .platform = linux_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
@@ -988,6 +1024,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
     \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
@@ -1021,6 +1058,8 @@ fn runnerZig() []const u8 {
     \\    const shortcuts = options.resolvedShortcuts(&shortcut_storage);
     \\    var menu_storage: MenuStorage = .{};
     \\    const menus = options.resolvedMenus(&menu_storage);
+    \\    var command_storage: CommandStorage = .{};
+    \\    const commands = options.resolvedCommands(&command_storage);
     \\    var runtime = zero_native.Runtime.init(.{
     \\        .platform = windows_platform.platform(),
     \\        .trace_sink = runtime_trace_sink,
@@ -1029,6 +1068,7 @@ fn runnerZig() []const u8 {
     \\        .builtin_bridge = options.builtin_bridge,
     \\        .security = options.security,
     \\        .js_window_api = options.js_window_api,
+    \\        .commands = commands,
     \\        .menus = menus,
     \\        .shortcuts = shortcuts,
     \\        .automation = if (build_options.automation) zero_native.automation.Server.init(init.io, ".zig-cache/zero-native-automation", app_info.resolvedWindowTitle()) else null,
@@ -1984,6 +2024,8 @@ test "writeDefaultApp emits Vite project files" {
     try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "frontend/dist") != null);
     try std.testing.expect(std.mem.indexOf(u8, main_zig_text, "127.0.0.1:5173") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "@import(\"app_manifest_zon\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "commands: ?[]const zero_native.Command = null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "resolvedCommands") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "menus: ?[]const zero_native.Menu = null") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "resolvedMenus") != null);
     try std.testing.expect(std.mem.indexOf(u8, runner_zig_text, "shortcuts: ?[]const zero_native.Shortcut = null") != null);
