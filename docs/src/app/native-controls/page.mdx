@@ -11,11 +11,12 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "live", .kind = .checkbox, .parent = "toolbar", .text = "Live" },
     .{ .label = "view-mode", .kind = .segmented_control, .parent = "toolbar", .text = "List|Grid" },
     .{ .label = "syncing", .kind = .progress_indicator, .parent = "toolbar", .role = "Syncing" },
-    .{ .label = "sidebar", .kind = .sidebar, .edge = .left, .width = 240 },
+    .{ .label = "body", .kind = .split, .fill = true, .axis = .row },
+    .{ .label = "sidebar", .kind = .sidebar, .parent = "body", .width = 240 },
     .{ .label = "filters", .kind = .stack, .parent = "sidebar", .x = 16, .y = 16, .width = 180, .height = 120, .axis = .column },
     .{ .label = "filter-title", .kind = .label, .parent = "filters", .text = "Filters" },
     .{ .label = "filter-live", .kind = .checkbox, .parent = "filters", .text = "Live" },
-    .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
+    .{ .label = "main", .kind = .webview, .parent = "body", .url = "zero://inline", .fill = true },
 };
 
 const shell_windows = [_]zero_native.ShellWindow{.{
@@ -40,7 +41,7 @@ fn scene(context: *anyopaque) anyerror!zero_native.ShellConfig {
 | `titlebar_accessory` | Native titlebar-adjacent container where the platform allows it |
 | `sidebar` | Native side panel container |
 | `statusbar` | Native bottom/status container |
-| `split` | Native container for split-pane shell regions |
+| `split` | Native container for fixed and fill panes; set `axis` to `.row` or `.column` |
 | `stack` | Native container for grouped child controls; set `axis` to `.row` or `.column` |
 | `button` | Dispatches `command` through `Event.command` |
 | `icon_button` | Compact command button for toolbar-style actions |
@@ -58,7 +59,7 @@ The macOS, Linux, and Windows system-WebView backends support these native kinds
 
 ## Layout
 
-For declarative shell views, use `edge` for docked chrome, `fill = true` for content, `parent` for controls inside containers, `axis` for row or column child flow, and min/max size fields when a surface needs resize constraints. The runtime keeps shell views bound to the window and reapplies their frames on resize.
+For declarative shell views, use `edge` for docked chrome, `fill = true` for content, `parent` for controls inside containers, `axis` for row or column child flow, and min/max size fields when a surface needs resize constraints. `stack` containers apply native spacing between controls; `split` containers divide panes along their axis without spacing, so a fixed sidebar and fill WebView can resize together. The runtime keeps shell views bound to the window and reapplies their frames on resize.
 
 Use `role` for accessibility text. Use `text` for visible labels, button titles, and text/search placeholders when no separate role is needed.
 

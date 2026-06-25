@@ -2283,7 +2283,9 @@ const RuntimeView = struct {
 
 const ShellResolvedView = struct {
     label: []const u8 = "",
+    kind: app_manifest.ViewKind = .webview,
     frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    absolute_frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
     axis: app_manifest.ShellAxis = .row,
 };
 
@@ -2332,9 +2334,14 @@ const ShellLayout = struct {
     fn parentedFrame(self: *ShellLayout, view: app_manifest.ShellView) !geometry.RectF {
         const parent_label = view.parent orelse return error.InvalidViewOptions;
         const parent = self.findView(parent_label) orelse return error.InvalidViewOptions;
+        if (parent.kind == .split) return self.splitChildFrame(view, parent);
+        return self.stackChildFrame(view, parent);
+    }
+
+    fn stackChildFrame(self: *ShellLayout, view: app_manifest.ShellView, parent: ShellResolvedView) geometry.RectF {
         const width = constrainedShellWidth(view, view.width orelse defaultShellViewWidth(view.kind));
         const height = constrainedShellHeight(view, view.height orelse defaultShellViewHeight(view.kind, parent.frame.height));
-        const cursor = self.parentCursor(parent_label);
+        const cursor = self.parentCursor(parent);
         const x = view.x orelse switch (parent.axis) {
             .row => cursor.x,
             .column => 8,
@@ -2350,6 +2357,34 @@ const ShellLayout = struct {
             .column => if (view.y == null) {
                 cursor.y = y + height + 8;
             },
+        }
+        return geometry.RectF.init(x, y, width, height);
+    }
+
+    fn splitChildFrame(self: *ShellLayout, view: app_manifest.ShellView, parent: ShellResolvedView) geometry.RectF {
+        const cursor = self.parentCursor(parent);
+        const x = view.x orelse switch (parent.axis) {
+            .row => cursor.x,
+            .column => 0,
+        };
+        const y = view.y orelse switch (parent.axis) {
+            .row => 0,
+            .column => cursor.y,
+        };
+        const remaining_width = @max(parent.frame.width - x, 0);
+        const remaining_height = @max(parent.frame.height - y, 0);
+        const width = constrainedShellWidth(view, view.width orelse switch (parent.axis) {
+            .row => if (view.fill) remaining_width else defaultShellViewWidth(view.kind),
+            .column => remaining_width,
+        });
+        const height = constrainedShellHeight(view, view.height orelse switch (parent.axis) {
+            .row => remaining_height,
+            .column => if (view.fill) remaining_height else defaultShellViewHeight(view.kind, parent.frame.height),
+        });
+
+        switch (parent.axis) {
+            .row => cursor.x = @max(cursor.x, x + width),
+            .column => cursor.y = @max(cursor.y, y + height),
         }
         return geometry.RectF.init(x, y, width, height);
     }
@@ -2373,9 +2408,17 @@ const ShellLayout = struct {
 
     fn recordView(self: *ShellLayout, view: app_manifest.ShellView, frame: geometry.RectF) !void {
         if (self.view_count >= self.views.len) return error.ViewLimitReached;
+        var absolute_frame = frame;
+        if (view.parent) |parent_label| {
+            const parent = self.findView(parent_label) orelse return error.InvalidViewOptions;
+            absolute_frame.x += parent.absolute_frame.x;
+            absolute_frame.y += parent.absolute_frame.y;
+        }
         self.views[self.view_count] = .{
             .label = view.label,
+            .kind = view.kind,
             .frame = frame,
+            .absolute_frame = absolute_frame,
             .axis = view.axis orelse .row,
         };
         self.view_count += 1;
@@ -2388,12 +2431,13 @@ const ShellLayout = struct {
         return null;
     }
 
-    fn parentCursor(self: *ShellLayout, label: []const u8) *ShellParentCursor {
+    fn parentCursor(self: *ShellLayout, parent: ShellResolvedView) *ShellParentCursor {
         for (self.parent_cursors[0..self.parent_cursor_count]) |*cursor| {
-            if (std.mem.eql(u8, cursor.label, label)) return cursor;
+            if (std.mem.eql(u8, cursor.label, parent.label)) return cursor;
         }
         const index = self.parent_cursor_count;
-        self.parent_cursors[index] = .{ .label = label };
+        const origin: f32 = if (parent.kind == .split) 0 else 8;
+        self.parent_cursors[index] = .{ .label = parent.label, .x = origin, .y = origin };
         self.parent_cursor_count += 1;
         return &self.parent_cursors[index];
     }
@@ -2407,12 +2451,15 @@ fn shellRestorePolicy(policy: app_manifest.WindowRestorePolicy) platform.WindowR
 }
 
 fn shellViewOptions(window_id: platform.WindowId, view: app_manifest.ShellView, layout: *ShellLayout) !platform.ViewOptions {
+    const frame = try layout.frameFor(view);
+    const resolved = layout.findView(view.label) orelse return error.InvalidViewOptions;
+    const platform_frame = if (view.kind == .webview and view.parent != null) resolved.absolute_frame else frame;
     return .{
         .window_id = window_id,
         .label = view.label,
         .kind = shellViewKind(view.kind),
         .parent = view.parent,
-        .frame = try layout.frameFor(view),
+        .frame = platform_frame,
         .layer = view.layer,
         .visible = view.visible,
         .enabled = view.enabled,
@@ -3618,6 +3665,48 @@ test "runtime lays out stack children by column axis" {
     try std.testing.expectEqual(@as(f32, 40), live.frame.y);
     try std.testing.expectEqual(@as(f32, 8), mode.frame.x);
     try std.testing.expectEqual(@as(f32, 80), mode.frame.y);
+}
+
+test "runtime lays out split panes and parented webview frames" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "shell-split", .source = platform.WebViewSource.html("<h1>Split</h1>") };
+        }
+    };
+
+    const shell_views = [_]app_manifest.ShellView{
+        .{ .label = "toolbar", .kind = .toolbar, .edge = .top, .height = 44 },
+        .{ .label = "body", .kind = .split, .fill = true, .axis = .row },
+        .{ .label = "navigator", .kind = .sidebar, .parent = "body", .width = 220 },
+        .{ .label = "main", .kind = .webview, .parent = "body", .url = "zero://inline", .fill = true },
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{ .id = 1, .size = geometry.SizeF.init(800, 600) });
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+    try harness.runtime.createShellViews(1, &shell_views, geometry.RectF.init(0, 0, 800, 600));
+
+    var views_buffer: [6]platform.ViewInfo = undefined;
+    const views = harness.runtime.listViews(1, &views_buffer);
+    const body = testViewByLabel(views, "body").?;
+    const navigator = testViewByLabel(views, "navigator").?;
+    const main = testViewByLabel(views, "main").?;
+
+    try std.testing.expectEqual(platform.ViewKind.split, body.kind);
+    try std.testing.expectEqual(@as(f32, 0), body.frame.x);
+    try std.testing.expectEqual(@as(f32, 44), body.frame.y);
+    try std.testing.expectEqual(@as(f32, 800), body.frame.width);
+    try std.testing.expectEqual(@as(f32, 556), body.frame.height);
+    try std.testing.expectEqualStrings("body", navigator.parent.?);
+    try std.testing.expectEqual(@as(f32, 0), navigator.frame.x);
+    try std.testing.expectEqual(@as(f32, 0), navigator.frame.y);
+    try std.testing.expectEqual(@as(f32, 220), navigator.frame.width);
+    try std.testing.expectEqual(@as(f32, 556), navigator.frame.height);
+    try std.testing.expectEqual(@as(f32, 220), main.frame.x);
+    try std.testing.expectEqual(@as(f32, 44), main.frame.y);
+    try std.testing.expectEqual(@as(f32, 580), main.frame.width);
+    try std.testing.expectEqual(@as(f32, 556), main.frame.height);
 }
 
 test "runtime loads scene hook as native shell startup" {
