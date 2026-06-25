@@ -32,6 +32,7 @@ export const navSections: NavSection[] = [
       { name: "Menus", href: "/menus" },
       { name: "Native Controls", href: "/native-controls" },
       { name: "Capabilities", href: "/capabilities" },
+      { name: "Platform Support", href: "/platform-support" },
       { name: "System Tray", href: "/tray" },
       { name: "Security", href: "/security" },
     ],

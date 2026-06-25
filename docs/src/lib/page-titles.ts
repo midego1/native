@@ -1,5 +1,5 @@
 export const PAGE_TITLES: Record<string, string> = {
-  "": "Build Desktop Apps\nwith Zig + WebView",
+  "": "Build Native Apps\nwith Zig, Web, and OS Surfaces",
   "quick-start": "Quick Start",
   "app-model": "App Model",
   frontend: "Frontend Projects",
@@ -13,6 +13,7 @@ export const PAGE_TITLES: Record<string, string> = {
   menus: "Menus",
   "native-controls": "Native Controls",
   capabilities: "Capabilities",
+  "platform-support": "Platform Support",
   tray: "System Tray",
   security: "Security",
   cli: "CLI Reference",

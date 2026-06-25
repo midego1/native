@@ -1,0 +1,40 @@
+# Platform Support
+
+zero-native exposes one runtime model across desktop hosts, but native affordances land per platform and per web engine. Unsupported operations return explicit runtime errors instead of pretending that every host can do the same thing.
+
+## Desktop Hosts
+
+| Area | macOS system WebView | macOS Chromium | Linux system WebView | Linux Chromium | Windows system WebView |
+| --- | --- | --- | --- | --- | --- |
+| Main WebView | Supported | Supported | Supported | Supported | Supported |
+| Child WebViews | Supported | Supported | Supported | Unsupported | Supported |
+| Native views | Supported | Unsupported | Supported | Unsupported | Supported |
+| Native control commands | Supported | Unsupported | Supported | Unsupported | Supported |
+| App menus | Supported | Unsupported | Platform menu work in progress | Unsupported | Platform menu work in progress |
+| Keyboard shortcuts | Supported | Supported | Supported | Supported | Supported |
+| Dialogs | Supported | Supported | Supported | Unsupported | Runtime support in progress |
+| Clipboard text | Supported | Supported | Supported | Unsupported | Supported |
+| Clipboard rich data | Supported | Supported | Unsupported | Unsupported | Unsupported |
+| Open URL / reveal path | Supported | Supported | Supported | Unsupported | Supported |
+| Notifications | Supported | Supported | Supported | Unsupported | Unsupported |
+| Recent documents | Supported | Supported | Unsupported | Unsupported | Supported |
+| Credentials | Supported | Supported | Unsupported | Unsupported | Supported |
+| File drops | Supported | Unsupported | Unsupported | Unsupported | Supported |
+| App activation events | Supported | Supported | Supported | Unsupported | Supported |
+
+## Native Surfaces
+
+The macOS, Linux, and Windows system-WebView hosts support `toolbar`, `titlebar_accessory`, `sidebar`, `statusbar`, `button`, `checkbox`, `toggle`, `text_field`, `search_field`, `label`, `spacer`, and `progress_indicator` native view kinds.
+
+`ViewKind.webview` is the compatibility path for WebView-backed views. Existing `runtime.createWebView(...)` and `window.zero.webviews.*` APIs remain available.
+
+## Mobile And GPU
+
+iOS, Android, and `gpu_surface` are not part of the current supported desktop host matrix. The public API already reserves the native view vocabulary needed for those surfaces, but the shipped support today is desktop-first.
+
+## Related Docs
+
+- [Native Controls](/native-controls)
+- [Web Engines](/web-engines)
+- [Capabilities](/capabilities)
+- [Builtin Commands](/bridge/builtin-commands)
