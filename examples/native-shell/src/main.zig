@@ -152,9 +152,10 @@ const shell_views = [_]zero_native.ShellView{
     .{ .label = "surface-search", .kind = .search_field, .parent = "title-search", .x = 0, .y = 3, .width = 280, .height = 28, .layer = 22, .text = "Search native surfaces" },
     .{ .label = "sidebar", .kind = .sidebar, .edge = .left, .width = sidebar_width, .min_width = 200, .max_width = 320, .layer = 10, .role = "Sidebar" },
     .{ .label = "sidebar-title", .kind = .label, .parent = "sidebar", .x = 18, .y = 18, .width = 180, .height = 20, .layer = 11, .text = "Workspace" },
-    .{ .label = "sidebar-item", .kind = .label, .parent = "sidebar", .x = 18, .y = 52, .width = 180, .height = 20, .layer = 11, .text = "Native chrome" },
-    .{ .label = "sidebar-live", .kind = .checkbox, .parent = "sidebar", .x = 18, .y = 92, .width = 160, .height = 24, .layer = 11, .text = "Live native UI" },
-    .{ .label = "sidebar-mode", .kind = .toggle, .parent = "sidebar", .x = 18, .y = 128, .width = 128, .height = 28, .layer = 11, .text = "Focus mode" },
+    .{ .label = "sidebar-stack", .kind = .stack, .parent = "sidebar", .x = 18, .y = 52, .width = 180, .height = 124, .axis = .column, .layer = 11 },
+    .{ .label = "sidebar-item", .kind = .label, .parent = "sidebar-stack", .width = 180, .height = 20, .layer = 12, .text = "Native chrome" },
+    .{ .label = "sidebar-live", .kind = .checkbox, .parent = "sidebar-stack", .width = 160, .height = 24, .layer = 12, .text = "Live native UI" },
+    .{ .label = "sidebar-mode", .kind = .toggle, .parent = "sidebar-stack", .width = 128, .height = 28, .layer = 12, .text = "Focus mode" },
     .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
     .{ .label = "statusbar", .kind = .statusbar, .edge = .bottom, .height = statusbar_height, .layer = 20, .role = "Status" },
     .{ .label = "status-label", .kind = .label, .parent = "statusbar", .x = 16, .y = 11, .width = 520, .height = 18, .layer = 21, .text = "Ready. Press Cmd-R or use the WebView button." },
@@ -233,13 +234,14 @@ test "native shell starts with native chrome views" {
     var app = NativeShellApp{};
     try harness.start(app.app());
 
-    var views_buffer: [16]zero_native.ViewInfo = undefined;
+    var views_buffer: [20]zero_native.ViewInfo = undefined;
     const views = harness.runtime.listViews(1, &views_buffer);
     try std.testing.expect(containsView(views, "toolbar", .toolbar));
     try std.testing.expect(containsView(views, "refresh-icon", .icon_button));
     try std.testing.expect(containsView(views, "view-mode", .segmented_control));
     try std.testing.expect(containsView(views, "surface-search", .search_field));
     try std.testing.expect(containsView(views, "sidebar", .sidebar));
+    try std.testing.expect(containsView(views, "sidebar-stack", .stack));
     try std.testing.expect(containsView(views, "sidebar-live", .checkbox));
     try std.testing.expect(containsView(views, "sidebar-mode", .toggle));
     try std.testing.expect(containsView(views, "statusbar", .statusbar));

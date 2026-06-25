@@ -2284,11 +2284,13 @@ const RuntimeView = struct {
 const ShellResolvedView = struct {
     label: []const u8 = "",
     frame: geometry.RectF = geometry.RectF.init(0, 0, 0, 0),
+    axis: app_manifest.ShellAxis = .row,
 };
 
 const ShellParentCursor = struct {
     label: []const u8 = "",
     x: f32 = 8,
+    y: f32 = 8,
 };
 
 const ShellLayout = struct {
@@ -2323,7 +2325,7 @@ const ShellLayout = struct {
             self.dockedFrame(view, edge)
         else
             explicitShellFrame(view);
-        try self.recordView(view.label, frame);
+        try self.recordView(view, frame);
         return frame;
     }
 
@@ -2333,9 +2335,22 @@ const ShellLayout = struct {
         const width = constrainedShellWidth(view, view.width orelse defaultShellViewWidth(view.kind));
         const height = constrainedShellHeight(view, view.height orelse defaultShellViewHeight(view.kind, parent.frame.height));
         const cursor = self.parentCursor(parent_label);
-        const x = view.x orelse cursor.x;
-        const y = view.y orelse centeredOffset(parent.frame.height, height);
-        if (view.x == null) cursor.x = x + width + 8;
+        const x = view.x orelse switch (parent.axis) {
+            .row => cursor.x,
+            .column => 8,
+        };
+        const y = view.y orelse switch (parent.axis) {
+            .row => centeredOffset(parent.frame.height, height),
+            .column => cursor.y,
+        };
+        switch (parent.axis) {
+            .row => if (view.x == null) {
+                cursor.x = x + width + 8;
+            },
+            .column => if (view.y == null) {
+                cursor.y = y + height + 8;
+            },
+        }
         return geometry.RectF.init(x, y, width, height);
     }
 
@@ -2356,9 +2371,13 @@ const ShellLayout = struct {
         return frame;
     }
 
-    fn recordView(self: *ShellLayout, label: []const u8, frame: geometry.RectF) !void {
+    fn recordView(self: *ShellLayout, view: app_manifest.ShellView, frame: geometry.RectF) !void {
         if (self.view_count >= self.views.len) return error.ViewLimitReached;
-        self.views[self.view_count] = .{ .label = label, .frame = frame };
+        self.views[self.view_count] = .{
+            .label = view.label,
+            .frame = frame,
+            .axis = view.axis orelse .row,
+        };
         self.view_count += 1;
     }
 
@@ -3560,6 +3579,45 @@ test "runtime clamps shell view layout constraints" {
     try std.testing.expectEqual(@as(f32, 44), content.frame.y);
     try std.testing.expectEqual(@as(f32, 480), content.frame.width);
     try std.testing.expectEqual(@as(f32, 360), content.frame.height);
+}
+
+test "runtime lays out stack children by column axis" {
+    const TestApp = struct {
+        fn app(self: *@This()) App {
+            return .{ .context = self, .name = "shell-stack-axis", .source = platform.WebViewSource.html("<h1>Stack</h1>") };
+        }
+    };
+
+    const shell_views = [_]app_manifest.ShellView{
+        .{ .label = "sidebar", .kind = .sidebar, .edge = .left, .width = 240 },
+        .{ .label = "filters", .kind = .stack, .parent = "sidebar", .x = 18, .y = 24, .width = 180, .height = 140, .axis = .column },
+        .{ .label = "filter-title", .kind = .label, .parent = "filters", .text = "Filters" },
+        .{ .label = "filter-live", .kind = .checkbox, .parent = "filters", .text = "Live" },
+        .{ .label = "filter-mode", .kind = .toggle, .parent = "filters", .text = "Focus" },
+        .{ .label = "main", .kind = .webview, .url = "zero://inline", .fill = true },
+    };
+
+    var harness: TestHarness() = undefined;
+    harness.init(.{ .id = 1, .size = geometry.SizeF.init(800, 600) });
+    var app_state: TestApp = .{};
+    try harness.start(app_state.app());
+    try harness.runtime.createShellViews(1, &shell_views, geometry.RectF.init(0, 0, 800, 600));
+
+    var views_buffer: [8]platform.ViewInfo = undefined;
+    const views = harness.runtime.listViews(1, &views_buffer);
+    const stack = testViewByLabel(views, "filters").?;
+    const title = testViewByLabel(views, "filter-title").?;
+    const live = testViewByLabel(views, "filter-live").?;
+    const mode = testViewByLabel(views, "filter-mode").?;
+
+    try std.testing.expectEqual(platform.ViewKind.stack, stack.kind);
+    try std.testing.expectEqualStrings("filters", title.parent.?);
+    try std.testing.expectEqual(@as(f32, 8), title.frame.x);
+    try std.testing.expectEqual(@as(f32, 8), title.frame.y);
+    try std.testing.expectEqual(@as(f32, 8), live.frame.x);
+    try std.testing.expectEqual(@as(f32, 40), live.frame.y);
+    try std.testing.expectEqual(@as(f32, 8), mode.frame.x);
+    try std.testing.expectEqual(@as(f32, 80), mode.frame.y);
 }
 
 test "runtime loads scene hook as native shell startup" {

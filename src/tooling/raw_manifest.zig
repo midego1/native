@@ -96,6 +96,7 @@ pub const RawShellView = struct {
     kind: []const u8,
     parent: ?[]const u8 = null,
     edge: ?[]const u8 = null,
+    axis: ?[]const u8 = null,
     x: ?f32 = null,
     y: ?f32 = null,
     width: ?f32 = null,

@@ -32,6 +32,7 @@ pub const ShellConfig = app_manifest.ShellConfig;
 pub const ShellWindow = app_manifest.ShellWindow;
 pub const ShellView = app_manifest.ShellView;
 pub const ShellEdge = app_manifest.ShellEdge;
+pub const ShellAxis = app_manifest.ShellAxis;
 
 pub const WebViewSource = platform.WebViewSource;
 pub const WebViewSourceKind = platform.WebViewSourceKind;

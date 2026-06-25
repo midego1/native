@@ -253,11 +253,17 @@ pub const ShellEdge = enum {
     left,
 };
 
+pub const ShellAxis = enum {
+    row,
+    column,
+};
+
 pub const ShellView = struct {
     label: []const u8,
     kind: ViewKind,
     parent: ?[]const u8 = null,
     edge: ?ShellEdge = null,
+    axis: ?ShellAxis = null,
     x: ?f32 = null,
     y: ?f32 = null,
     width: ?f32 = null,
