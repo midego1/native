@@ -252,6 +252,11 @@ pub fn build(b: *std.Build) void {
         "examples/mobile-shell/app.zon",
     });
 
+    const examples_step = b.step("test-examples", "Run all example tests and layout checks");
+    examples_step.dependOn(frontend_examples_step);
+    examples_step.dependOn(native_examples_step);
+    examples_step.dependOn(mobile_examples_step);
+
     const build_webview_cef = b.addSystemCommand(&.{ "zig", "build", "-Dplatform=macos", "-Dweb-engine=chromium", b.fmt("-Dcef-dir={s}", .{cef_dir}) });
     build_webview_cef.setCwd(b.path("examples/webview"));
     const webview_cef_link_step = b.step("test-webview-cef-link", "Build the WebView example with Chromium/CEF");

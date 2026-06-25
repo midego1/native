@@ -24,11 +24,14 @@ zig build test
 zig build test-desktop
 zig build test-automation-protocol
 zig build test-platform-info
+zig build test-examples
 zig build test-examples-native
 zig build test-examples-mobile
 ```
 
 Bridge and IPC coverage lives in the headless desktop tests: they inject platform bridge events, exercise command policy and handlers, and assert the platform response without launching a WebView. Automation command parsing is covered by `test-automation-protocol`.
+
+`test-examples` runs all repository example checks. Use the narrower example groups when you want a faster pass over one slice.
 
 `test-examples-native` runs the headless tests for `examples/command-app`, `examples/native-shell`, `examples/native-panels`, and `examples/capabilities` with `-Dplatform=null`. This keeps command routing, native view composition, and guarded OS capability examples covered from the repository root.
 
