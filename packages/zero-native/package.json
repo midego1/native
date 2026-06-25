@@ -1,7 +1,7 @@
 {
   "name": "zero-native",
   "version": "0.3.0",
-  "description": "Zig desktop app shell with WebView — CLI tools",
+  "description": "Zig native app framework with secure WebView surfaces, native controls, and OS capabilities",
   "type": "module",
   "bin": {
     "zero-native": "bin/zero-native.js"
