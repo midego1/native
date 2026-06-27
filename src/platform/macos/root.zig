@@ -889,6 +889,7 @@ fn showOpenDialog(context: ?*anyopaque, options: platform_mod.OpenDialogOptions,
         .allow_multiple = if (options.allow_multiple) 1 else 0,
     };
     const result = zero_native_appkit_show_open_dialog(self.host, &opts, buffer.ptr, buffer.len);
+    if (result.bytes_written > buffer.len) return error.NoSpaceLeft;
     return .{
         .count = result.count,
         .paths = buffer[0..result.bytes_written],
@@ -910,6 +911,7 @@ fn showSaveDialog(context: ?*anyopaque, options: platform_mod.SaveDialogOptions,
         .extensions_len = ext_str.len,
     };
     const written = zero_native_appkit_show_save_dialog(self.host, &opts, buffer.ptr, buffer.len);
+    if (written > buffer.len) return error.NoSpaceLeft;
     if (written == 0) return null;
     return buffer[0..written];
 }

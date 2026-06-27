@@ -4,6 +4,7 @@
 #include <webkit/webkit.h>
 #include <glib/gstdio.h>
 #include <dlfcn.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -19,6 +20,10 @@
 #define ZERO_NATIVE_SHORTCUT_MODIFIER_CONTROL (1u << 2)
 #define ZERO_NATIVE_SHORTCUT_MODIFIER_OPTION  (1u << 3)
 #define ZERO_NATIVE_SHORTCUT_MODIFIER_SHIFT   (1u << 4)
+
+static size_t zero_native_overflow_size(size_t buffer_len) {
+    return buffer_len == SIZE_MAX ? SIZE_MAX : buffer_len + 1;
+}
 
 #define ZERO_NATIVE_GTK_VIEW_WEBVIEW 0
 #define ZERO_NATIVE_GTK_VIEW_TOOLBAR 1
@@ -2809,6 +2814,7 @@ zero_native_gtk_open_dialog_result_t zero_native_gtk_show_open_dialog(zero_nativ
     g_main_loop_unref(state.loop);
     if (state.files) {
         size_t offset = 0;
+        int overflow = 0;
         guint count = g_list_model_get_n_items(state.files);
         for (guint i = 0; i < count; i++) {
             GFile *file = G_FILE(g_list_model_get_item(state.files, i));
@@ -2816,17 +2822,20 @@ zero_native_gtk_open_dialog_result_t zero_native_gtk_show_open_dialog(zero_nativ
             if (path) {
                 size_t len = strlen(path);
                 size_t needed = len + (result.count > 0 ? 1 : 0);
-                if (offset + needed <= buffer_len) {
+                if (needed <= buffer_len - offset) {
                     if (result.count > 0) buffer[offset++] = '\n';
                     memcpy(buffer + offset, path, len);
                     offset += len;
                     result.count++;
+                } else {
+                    overflow = 1;
                 }
                 g_free(path);
             }
             g_object_unref(file);
+            if (overflow) break;
         }
-        result.bytes_written = offset;
+        result.bytes_written = overflow ? zero_native_overflow_size(buffer_len) : offset;
         g_object_unref(state.files);
     }
     if (title) free(title);
@@ -2856,8 +2865,12 @@ size_t zero_native_gtk_show_save_dialog(zero_native_gtk_host_t *host, const zero
         char *path = g_file_get_path(state.file);
         if (path) {
             size_t len = strlen(path);
-            written = len < buffer_len ? len : buffer_len;
-            memcpy(buffer, path, written);
+            if (len > buffer_len) {
+                written = zero_native_overflow_size(buffer_len);
+            } else {
+                written = len;
+                memcpy(buffer, path, written);
+            }
             g_free(path);
         }
         g_object_unref(state.file);

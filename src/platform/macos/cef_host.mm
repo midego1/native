@@ -5,6 +5,7 @@
 #import <Security/Security.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <crt_externs.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2073,6 +2074,10 @@ static NSArray<NSString *> *ZeroNativeParseExtensions(const char *extensions, si
     return result.count > 0 ? result : nil;
 }
 
+static size_t ZeroNativeOverflowSize(size_t buffer_len) {
+    return buffer_len == SIZE_MAX ? SIZE_MAX : buffer_len + 1;
+}
+
 static void ZeroNativeConfigurePanelExtensions(NSSavePanel *panel, NSArray<NSString *> *extensions) {
     if (!extensions || extensions.count == 0) return;
     if (@available(macOS 11.0, *)) {
@@ -2105,18 +2110,22 @@ zero_native_appkit_open_dialog_result_t zero_native_appkit_show_open_dialog(zero
         if ([panel runModal] != NSModalResponseOK) return result;
 
         size_t offset = 0;
+        BOOL overflow = NO;
         for (NSURL *url in panel.URLs) {
             NSString *path = url.path;
             NSData *data = [path dataUsingEncoding:NSUTF8StringEncoding];
             if (!data) continue;
             size_t needed = data.length + (result.count > 0 ? 1 : 0);
-            if (offset + needed > buffer_len) break;
+            if (needed > buffer_len - offset) {
+                overflow = YES;
+                break;
+            }
             if (result.count > 0) { buffer[offset] = '\n'; offset++; }
             memcpy(buffer + offset, data.bytes, data.length);
             offset += data.length;
             result.count++;
         }
-        result.bytes_written = offset;
+        result.bytes_written = overflow ? ZeroNativeOverflowSize(buffer_len) : offset;
     }
     return result;
 }
@@ -2142,7 +2151,8 @@ size_t zero_native_appkit_show_save_dialog(zero_native_appkit_host_t *host, cons
         NSString *path = panel.URL.path;
         NSData *data = [path dataUsingEncoding:NSUTF8StringEncoding];
         if (!data) return 0;
-        size_t count = MIN(buffer_len, data.length);
+        size_t count = data.length;
+        if (count > buffer_len) return ZeroNativeOverflowSize(buffer_len);
         memcpy(buffer, data.bytes, count);
         return count;
     }

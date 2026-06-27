@@ -415,6 +415,10 @@ static void finishCom(bool uninitialize) {
     if (uninitialize) CoUninitialize();
 }
 
+static size_t overflowSize(size_t buffer_len) {
+    return buffer_len == SIZE_MAX ? SIZE_MAX : buffer_len + 1;
+}
+
 static void setDialogTitle(IFileDialog *dialog, const char *title, size_t title_len) {
     if (!dialog || !title || title_len == 0) return;
     std::wstring title_wide = widen(slice(title, title_len));
@@ -470,9 +474,12 @@ static void setDialogFilters(IFileDialog *dialog, const char *extensions, size_t
 
 static bool appendPathToBuffer(char *buffer, size_t buffer_len, size_t *offset, size_t *count, const std::wstring &path_wide) {
     std::string path = narrow(path_wide);
-    if (path.empty()) return false;
+    if (path.empty()) return true;
     size_t needed = path.size() + (*count > 0 ? 1 : 0);
-    if (*offset + needed > buffer_len) return false;
+    if (needed > buffer_len - *offset) {
+        *offset = overflowSize(buffer_len);
+        return false;
+    }
     if (*count > 0) buffer[(*offset)++] = '\n';
     memcpy(buffer + *offset, path.data(), path.size());
     *offset += path.size();
@@ -2484,12 +2491,14 @@ WindowsOpenDialogResult zero_native_windows_show_open_dialog(Host *host, const W
             for (DWORD index = 0; index < count; ++index) {
                 IShellItem *item = nullptr;
                 if (SUCCEEDED(items->GetItemAt(index, &item)) && item) {
+                    bool overflow = false;
                     PWSTR path = nullptr;
                     if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
-                        appendPathToBuffer(buffer, buffer_len, &offset, &written_count, std::wstring(path));
+                        overflow = !appendPathToBuffer(buffer, buffer_len, &offset, &written_count, std::wstring(path));
                         CoTaskMemFree(path);
                     }
                     item->Release();
+                    if (overflow) break;
                 }
             }
             result.count = written_count;
@@ -2530,8 +2539,12 @@ size_t zero_native_windows_show_save_dialog(Host *host, const WindowsSaveDialogO
             PWSTR path = nullptr;
             if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
                 std::string utf8_path = narrow(std::wstring(path));
-                written = utf8_path.size() < buffer_len ? utf8_path.size() : buffer_len;
-                if (written > 0) memcpy(buffer, utf8_path.data(), written);
+                if (utf8_path.size() > buffer_len) {
+                    written = overflowSize(buffer_len);
+                } else {
+                    written = utf8_path.size();
+                    if (written > 0) memcpy(buffer, utf8_path.data(), written);
+                }
                 CoTaskMemFree(path);
             }
             item->Release();
