@@ -935,6 +935,88 @@ test "widget grid layout places children in deterministic cells" {
     try std.testing.expectEqual(@as(usize, 8), builder.displayList().commandCount());
 }
 
+test "widget grid keeps declared column slots when children run short" {
+    // Fewer children than the declared columns (a filtered grid): each
+    // child keeps the column-slot width the declared count derives —
+    // never stretching across the freed row — filling the leading slots
+    // and leaving the trailing slots empty.
+    const children = [_]Widget{
+        .{ .id = 2, .kind = .text, .text = "One" },
+        .{ .id = 3, .kind = .text, .text = "Two" },
+    };
+    const grid = Widget{
+        .id = 1,
+        .kind = .grid,
+        .layout = .{ .gap = 8, .columns = 4 },
+        .children = &children,
+    };
+
+    var nodes: [4]WidgetLayoutNode = undefined;
+    const layout = try layoutWidgetTree(grid, geometry.RectF.init(0, 0, 424, 40), &nodes);
+    try std.testing.expectEqual(@as(usize, 3), layout.nodeCount());
+    // Slot width = (424 - 3 gaps of 8) / 4 declared columns = 100.
+    try expectLayoutFrame(layout, 2, geometry.RectF.init(0, 0, 100, 40));
+    try expectLayoutFrame(layout, 3, geometry.RectF.init(108, 0, 100, 40));
+}
+
+test "widget grid row count survives a huge declared column count" {
+    const widget_tree = @import("widget_tree.zig");
+    // Declared columns are engine input (never validator-bounded): the
+    // additive ceil-div `(count + columns - 1) / columns` would overflow
+    // in safe builds for a huge but valid usize. A few children under
+    // maxInt columns is one row, not a panic.
+    const huge = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 1), widget_tree.gridRowCount(3, huge));
+    try std.testing.expectEqual(@as(usize, 1), widget_tree.gridRowCount(1, huge));
+    // Zero children (or zero columns) is zero rows in both paths.
+    try std.testing.expectEqual(@as(usize, 0), widget_tree.gridRowCount(0, huge));
+    try std.testing.expectEqual(@as(usize, 0), widget_tree.gridRowCount(0, 4));
+    try std.testing.expectEqual(@as(usize, 0), widget_tree.gridRowCount(5, 0));
+    // The ordinary shape still ceil-divides: 5 children over 2 columns
+    // is 3 rows.
+    try std.testing.expectEqual(@as(usize, 3), widget_tree.gridRowCount(5, 2));
+    try std.testing.expectEqual(@as(usize, 2), widget_tree.gridRowCount(4, 2));
+}
+
+test "nested widget grid with a huge declared column count measures intrinsically" {
+    // The root-grid case above never runs the INTRINSIC path: only a
+    // parent that measures its children (a column sizing an unframed
+    // child) reaches intrinsicGridChildrenSize, where the row math must
+    // be the same overflow-safe helper — the additive ceil-div panicked
+    // here while the placement path was already fixed.
+    const tiles = [_]Widget{
+        .{ .id = 3, .kind = .text, .text = "One" },
+        .{ .id = 4, .kind = .text, .text = "Two" },
+        .{ .id = 5, .kind = .text, .text = "Three" },
+    };
+    const grid = Widget{
+        .id = 2,
+        .kind = .grid,
+        .layout = .{ .gap = 8, .columns = std.math.maxInt(usize) },
+        .children = &tiles,
+    };
+    const column = Widget{
+        .id = 1,
+        .kind = .column,
+        .children = &[_]Widget{grid},
+    };
+
+    // The direct measurement: three children under maxInt columns is
+    // ONE row, so the grid's intrinsic height is one cell (no row gap).
+    const cell = support.intrinsicWidgetSize(tiles[0], .{});
+    const intrinsic = support.intrinsicWidgetSize(grid, .{});
+    try std.testing.expectEqual(cell.height, intrinsic.height);
+
+    // And the full pass: the column measures the unframed grid child
+    // intrinsically while laying out — no panic, one grid row.
+    var nodes: [8]WidgetLayoutNode = undefined;
+    const layout = try layoutWidgetTree(column, geometry.RectF.init(0, 0, 400, 120), &nodes);
+    try std.testing.expectEqual(@as(usize, 5), layout.nodeCount());
+    const first = layout.findById(3).?;
+    const last = layout.findById(5).?;
+    try std.testing.expectEqual(first.frame.y, last.frame.y);
+}
+
 test "widget virtualized grid lays out visible cells by row" {
     const children = [_]Widget{
         .{ .id = 2, .kind = .button, .text = "Zero" },

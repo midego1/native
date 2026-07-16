@@ -377,7 +377,7 @@ test "the shipping markup renders the committed captures: tiles, sparklines, tab
 
     // The status line carries the journaled Cmd.now stamp (the TestClock's
     // 12:34:56) — replayable by construction.
-    try std.testing.expect(h.hasText("561 processes · sampled at 12:34:56"));
+    try std.testing.expect(h.hasText("561 processes · sampled at 12:34:56 UTC"));
 
     // The table: 14 rows shown of 128 kept, top CPU first.
     try std.testing.expect(h.hasText("14 of 128"));
@@ -511,6 +511,14 @@ test "search filters through the byte-splice engine and the sort chips reorder t
     for (0..12) |_| try h.keyDown("backspace");
     try std.testing.expect(h.hasText("14 of 128"));
 
+    // A miss states its honest scope: search only sees the top-128
+    // selection the sampler keeps, and the empty state says so.
+    try h.textInput("zzzz");
+    try std.testing.expect(h.hasText("No matches for \"zzzz\""));
+    try std.testing.expect(h.hasText("Search sees the top 128 processes by CPU"));
+    for (0..4) |_| try h.keyDown("backspace");
+    try std.testing.expect(h.hasText("14 of 128"));
+
     // A pid query matches pid text (launchd is pid 1; "395" is
     // WindowServer's pid in the capture).
     try h.textInput("395");
@@ -585,10 +593,25 @@ test "the SIGTERM round trip: request copies the target, cancel never signals, c
     try h.spawnOutput(spawn_key_0, "", 0);
     try std.testing.expect(h.hasText("terminate request delivered"));
 
+    // The delivered notice is a moment, not a state: the NEXT applied
+    // sample (whose rows are the delivery's visible consequence)
+    // retires it from the footer.
+    try std.testing.expect(try h.fireSampleTimer());
+    try h.spawnOutput(spawn_key_0, ps_edge_fixture, 0);
+    try h.spawnOutput(spawn_key_1, vm_stat_fixture, 0);
+    try std.testing.expect(!h.hasText("terminate request delivered"));
+
     // A refused kill (not your process) is a note, never a crash.
     try h.menu("mon.kill.842");
     try h.click(h.findId(.button, "Send SIGTERM").?);
     try h.spawnOutput(spawn_key_0, "", 1);
+    try std.testing.expect(h.hasText("kill failed (code 1 — not your process?)"));
+
+    // Failure is a state worth keeping: the next sample does NOT clear
+    // the failed note (only the delivered notice is transient).
+    try std.testing.expect(try h.fireSampleTimer());
+    try h.spawnOutput(spawn_key_0, ps_edge_fixture, 0);
+    try h.spawnOutput(spawn_key_1, vm_stat_fixture, 0);
     try std.testing.expect(h.hasText("kill failed (code 1 — not your process?)"));
 
     // A vanished pid refuses the request with a note — the dialog never
@@ -602,6 +625,54 @@ test "the SIGTERM round trip: request copies the target, cancel never signals, c
     try std.testing.expectEqual(@as(usize, 1), h.app_state.effects.pendingClipboardCount());
     try std.testing.expectEqualStrings("renderfarm-worker", h.app_state.effects.pendingClipboardAt(0).?.text);
     try std.testing.expect(h.hasText("name copy requested"));
+}
+
+test "a sample already in flight at kill time cannot retire the delivered notice" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try h.bootMac();
+    try h.spawnOutput(spawn_key_0, ps_edge_fixture, 0);
+    try h.spawnOutput(spawn_key_1, vm_stat_fixture, 0);
+
+    // Fire the cadence so the NEXT round is in flight: its `ps`
+    // collected the row set BEFORE any kill below.
+    try std.testing.expect(try h.fireSampleTimer());
+    try std.testing.expect(Bridge.model().psInflight);
+
+    // Confirm the kill while that round runs; ps and the memory command
+    // hold slots 0 and 1, so the kill spawn parks on the next free slot
+    // — find it by its argv rather than assuming the slot number.
+    try h.menu("mon.kill.842");
+    try h.click(h.findId(.button, "Send SIGTERM").?);
+    var kill_key: u64 = 0;
+    var index: usize = 0;
+    while (h.app_state.effects.pendingSpawnAt(index)) |request| : (index += 1) {
+        if (std.mem.eql(u8, request.argv[0], "/bin/kill")) kill_key = request.key;
+    }
+    try std.testing.expect(kill_key != 0);
+
+    // Drain the delivered exit AND the stale ps exit in ONE batch before
+    // any rebuild — the worst interleaving in the field: kill_done marks
+    // the notice transient and the pre-termination rows land right
+    // behind it in the same drain.
+    try h.app_state.effects.feedOutput(kill_key, "");
+    try h.app_state.effects.feedExit(kill_key, 0);
+    try h.app_state.effects.feedOutput(spawn_key_0, ps_edge_fixture);
+    try h.app_state.effects.feedExit(spawn_key_0, 0);
+    try h.wake();
+
+    // The stale rows applied, and the notice SURVIVED them into the
+    // rendered footer — it must show for at least one full sample.
+    try std.testing.expectEqual(@as(i64, 2), Bridge.model().samplesTaken);
+    try std.testing.expect(h.hasText("terminate request delivered"));
+
+    // The first sample LAUNCHED after the kill shows the delivery's
+    // outcome, and retires the notice with it.
+    try h.spawnOutput(spawn_key_1, vm_stat_fixture, 0);
+    try std.testing.expect(try h.fireSampleTimer());
+    try h.spawnOutput(spawn_key_0, ps_edge_fixture, 0);
+    try std.testing.expect(!h.hasText("terminate request delivered"));
+    try h.spawnOutput(spawn_key_1, vm_stat_fixture, 0);
 }
 
 // ----------------------------------------------------------------- chrome

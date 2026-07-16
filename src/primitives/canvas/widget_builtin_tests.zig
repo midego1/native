@@ -1415,6 +1415,136 @@ test "design tokens provide theme and contrast palettes" {
     try std.testing.expectEqual(Easing.linear, reduced_motion.motion.easing);
 }
 
+test "the accent override desaturates its dark-scheme focus ring" {
+    const accent = Color.rgb8(223, 38, 112);
+
+    // Light keeps the raw accent on every identity slot, ring included.
+    const light = canvas.accentOverrides(accent, .light);
+    try std.testing.expectEqualDeep(accent, light.colors.accent.?);
+    try std.testing.expectEqualDeep(accent, light.colors.focus_ring.?);
+
+    // Dark keeps the accent identity but derives the ring at half the
+    // accent's HSL saturation — a quiet outline instead of a neon glare
+    // — through the exported derivation, so hand-authored token sets
+    // can state the same value.
+    const dark = canvas.accentOverrides(accent, .dark);
+    try std.testing.expectEqualDeep(accent, dark.colors.accent.?);
+    const ring = dark.colors.focus_ring.?;
+    try std.testing.expectEqualDeep(canvas.accentFocusRing(accent, .dark), ring);
+    try std.testing.expect(!std.meta.eql(accent, ring));
+    // Same lightness (HSL max+min preserved), lower chroma: the channel
+    // spread shrinks to half while the hue's ordering holds.
+    const accent_spread = @max(accent.r, @max(accent.g, accent.b)) - @min(accent.r, @min(accent.g, accent.b));
+    const ring_spread = @max(ring.r, @max(ring.g, ring.b)) - @min(ring.r, @min(ring.g, ring.b));
+    try std.testing.expect(ring_spread < accent_spread);
+    try std.testing.expect(ring.r > ring.b and ring.b > ring.g);
+
+    // An achromatic accent has no saturation to halve: the ring passes
+    // through untouched.
+    const gray = Color.rgb8(115, 115, 115);
+    try std.testing.expectEqualDeep(gray, canvas.accentFocusRing(gray, .dark));
+}
+
+test "the dark accent focus ring holds the non-text contrast floor across hues" {
+    // Rings draw OUTSIDE controls, so the tones that matter are the
+    // dark containers controls commonly sit on, across BOTH shipped
+    // packs: page background, card/popover surface, and the muted
+    // surface (the tabs-list pill container focusable triggers sit
+    // inside). accentFocusRing floors against the LIGHTEST of these
+    // (house surface_subtle #262626) — a ring clearing 3:1 there
+    // clears every darker tone in the set too; each is asserted below.
+    const house_dark = DesignTokens.theme(.{ .color_scheme = .dark }).colors;
+    const geist_dark = DesignTokens.theme(.{ .pack = .geist, .color_scheme = .dark }).colors;
+    const adjacent_tones = [_]Color{
+        house_dark.background, // #0a0a0a
+        house_dark.surface, // #171717
+        house_dark.surface_subtle, // #262626 — the floor's reference
+        geist_dark.background, // #000000 (Geist surface is the same black)
+        geist_dark.surface_subtle, // #1a1a1a
+    };
+    const reference_tone = house_dark.surface_subtle;
+    const cases = [_]Color{
+        // Green: the input clears 3:1 on the background AND the card
+        // surface; desaturation alone dropped to ~2.6:1 on the
+        // background (worse still on the surface) — the floor lifts it
+        // back over the bar on both. Against the muted reference the
+        // input itself sits just under 3:1 (~2.94), so the ring holds
+        // exactly that there — restored, never invented.
+        Color.rgb8(0, 128, 0),
+        // Deep blue: below 3:1 on its own; the ring must not get worse.
+        Color.rgb8(0, 0, 204),
+        // Dark red: below 3:1 on its own AND desaturation costs more —
+        // the floor restores the accent's own contrast, no further.
+        Color.rgb8(139, 0, 0),
+        // The soundboard pink: clears the bar before and after halving.
+        Color.rgb8(223, 38, 112),
+        // Achromatic gray: nothing to desaturate, passes through.
+        Color.rgb8(115, 115, 115),
+    };
+    for (cases) |accent| {
+        // Light passes the accent through untouched, every hue.
+        try std.testing.expectEqualDeep(accent, canvas.accentFocusRing(accent, .light));
+
+        const ring = canvas.accentFocusRing(accent, .dark);
+        // Dark never raises saturation; chromatic accents lose half.
+        const accent_saturation = testHslSaturation(accent);
+        const ring_saturation = testHslSaturation(ring);
+        if (accent_saturation > 0) {
+            try std.testing.expect(ring_saturation < accent_saturation);
+        } else {
+            try std.testing.expectEqualDeep(accent, ring);
+        }
+        // The floor, tone by tone: >= 3:1 (WCAG non-text) against EVERY
+        // adjacent tone the accent itself cleared it on. Flooring
+        // against the lightest tone guarantees the rest: where the
+        // accent cleared 3:1 anywhere, the ring's luminance lands at or
+        // above the accent's, so no darker tone can regress.
+        for (adjacent_tones) |tone| {
+            if (testContrastRatio(accent, tone) >= 3.0) {
+                try std.testing.expect(testContrastRatio(ring, tone) >= 3.0);
+            }
+        }
+        // The escape hatch, stated against the SAME reference the floor
+        // measures on: when the accent never cleared 3:1 there, the
+        // ring still never lands below the accent's own contrast.
+        const accent_contrast = testContrastRatio(accent, reference_tone);
+        const ring_contrast = testContrastRatio(ring, reference_tone);
+        if (accent_contrast >= 3.0) {
+            try std.testing.expect(ring_contrast >= 3.0);
+        } else {
+            try std.testing.expect(ring_contrast >= accent_contrast);
+        }
+    }
+}
+
+/// HSL saturation of a color, for the desaturation assertions.
+fn testHslSaturation(color: Color) f32 {
+    const max = @max(color.r, @max(color.g, color.b));
+    const min = @min(color.r, @min(color.g, color.b));
+    const delta = max - min;
+    if (delta <= 0.0001) return 0;
+    const lightness = (max + min) / 2;
+    return delta / (1 - @abs(2 * lightness - 1));
+}
+
+/// WCAG contrast ratio between two colors, for the floor assertions.
+fn testContrastRatio(a: Color, b: Color) f32 {
+    const la = testRelativeLuminance(a);
+    const lb = testRelativeLuminance(b);
+    return (@max(la, lb) + 0.05) / (@min(la, lb) + 0.05);
+}
+
+fn testRelativeLuminance(color: Color) f32 {
+    return 0.2126 * testSrgbToLinear(color.r) +
+        0.7152 * testSrgbToLinear(color.g) +
+        0.0722 * testSrgbToLinear(color.b);
+}
+
+fn testSrgbToLinear(channel: f32) f32 {
+    if (channel <= 0.04045) return channel / 12.92;
+    return std.math.pow(f32, (channel + 0.055) / 1.055, 2.4);
+}
+
 test "built-in component catalog covers house component set" {
     const expected_names = [_][]const u8{
         "Accordion",

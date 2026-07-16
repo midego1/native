@@ -1057,16 +1057,23 @@ test "the system appearance drives the custom tokens live" {
     // palettes, so these assertions follow the one source of truth).
     try testing.expectEqualDeep(theme.light_colors, main.tokensFromModel(&app_state.model).colors);
 
-    // The accent override actually landed: the filled-primary pair, the
-    // focus ring, and the slider's filled range all carry the same pink
-    // step in BOTH schemes — the scrubber is the one slot the pack
-    // states its own hue for, so it is pinned separately from `accent`.
+    // The accent override actually landed: the filled-primary pair and
+    // the slider's filled range carry the same pink step in BOTH
+    // schemes — the scrubber is the one slot the pack states its own
+    // hue for, so it is pinned separately from `accent`.
     const pink = canvas.Color.rgb8(223, 38, 112);
     for ([_]canvas.ColorTokens{ theme.light_colors, theme.dark_colors }) |colors| {
         try testing.expectEqualDeep(pink, colors.accent);
         try testing.expectEqualDeep(canvas.Color.rgb8(255, 255, 255), colors.accent_text);
-        try testing.expectEqualDeep(pink, colors.focus_ring);
     }
+    // The focus ring is stated per scheme: raw pink in light, the
+    // desaturated dark step in dark (canvas.accentFocusRing — the same
+    // derivation the manifest theme_accent channel applies, so the TS
+    // port's ring matches). Full-chroma pink would glare neon on the
+    // dark palette.
+    try testing.expectEqualDeep(pink, theme.light_colors.focus_ring);
+    try testing.expectEqualDeep(canvas.accentFocusRing(pink, .dark), theme.dark_colors.focus_ring);
+    try testing.expect(!std.meta.eql(pink, theme.dark_colors.focus_ring));
     for ([_]native_sdk.ColorScheme{ .light, .dark }) |scheme| {
         try testing.expectEqualDeep(pink, theme.tokens(scheme, false, false).controls.slider.active_background.?);
     }
@@ -1946,6 +1953,39 @@ fn expectChunking(rows: usize, counts: []const usize, first_x: []const f32, colu
     for (first_x) |x| {
         try testing.expectEqual(first_x[0], x);
     }
+}
+
+test "a search narrowed below the column count keeps natural tile size" {
+    const live = try LiveApp.start(true);
+    defer live.stop();
+
+    // Establish the four-column desktop fit, then search down to ONE
+    // matching album (the last album's title matches "channel" and
+    // nothing else does — see the typed-dispatch search test).
+    try resizeTo(live, main.window_width, main.window_height, 2);
+    const fit = view_mod.gridFit(main.window_width);
+    try testing.expect(fit.columns > 1);
+    try live.dispatch(.{ .search_edit = .{ .insert_text = "channel" } });
+
+    // The lone tile keeps the fit's natural tile width — image-forward
+    // covers never balloon across the freed row — and stays pinned to
+    // the leading content edge, leaving the trailing space empty.
+    var layout = try live.harness.runtime.canvasWidgetLayout(1, main.canvas_label);
+    var tiles: usize = 0;
+    for (layout.nodes) |node| {
+        if (node.widget.kind != .list_item or node.widget.semantics.role != .listitem) continue;
+        tiles += 1;
+        try testing.expectApproxEqAbs(fit.tile_width, node.frame.width, 0.5);
+    }
+    try testing.expectEqual(@as(usize, 1), tiles);
+
+    // Clearing the search restores the full four-wide chunking.
+    try live.dispatch(.{ .search_edit = .clear });
+    var counts: [8]usize = undefined;
+    var first_x: [8]f32 = undefined;
+    layout = try live.harness.runtime.canvasWidgetLayout(1, main.canvas_label);
+    const rows = gridRowCounts(layout, &counts, &first_x);
+    try expectChunking(rows, counts[0..rows], first_x[0..rows], fit.columns);
 }
 
 test "chrome geometry pads the header and matches its height to the tall band" {
