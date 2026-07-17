@@ -716,6 +716,84 @@ test "resize-duration and resize-easing on split stamp the layout-tween declarat
     try testing.expectEqual(canvas.Easing.standard, plain.resize_easing);
 }
 
+test "anchor and tooltip-delay on tooltip stamp the hover-intent declaration" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = Model{};
+
+    // An anchored tooltip declaring its own delay, an anchored tooltip
+    // on the token default, and a bare static tooltip that keeps the
+    // classic paints-when-rendered leaf — so existing documents lower
+    // byte-identically.
+    var view = try InboxMarkup.init(arena, "<column>\n  <stack>\n    <text>Bold</text>\n    <tooltip anchor=\"above\" tooltip-delay=\"250\">Bold the selection</tooltip>\n  </stack>\n  <stack>\n    <text>Link</text>\n    <tooltip anchor=\"below\">Insert a link</tooltip>\n  </stack>\n  <tooltip>Copied!</tooltip>\n</column>");
+    var ui = InboxUi.init(arena);
+    const tree = try ui.finalize(try view.build(&ui, &model));
+
+    const declared = findByText(tree.root, .tooltip, "Bold the selection").?;
+    try testing.expectEqual(@as(i32, 250), declared.tooltip_delay_ms);
+    try testing.expectEqual(canvas.WidgetAnchorPlacement.above, declared.layout.anchor.?.placement);
+
+    const defaulted = findByText(tree.root, .tooltip, "Insert a link").?;
+    try testing.expectEqual(@as(i32, -1), defaulted.tooltip_delay_ms);
+    try testing.expectEqual(canvas.WidgetAnchorPlacement.below, defaulted.layout.anchor.?.placement);
+
+    const static = findByText(tree.root, .tooltip, "Copied!").?;
+    try testing.expectEqual(@as(i32, -1), static.tooltip_delay_ms);
+    try testing.expectEqual(@as(?canvas.WidgetAnchor, null), static.layout.anchor);
+}
+
+test "tooltip-delay past i32 max fails the build instead of trapping" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = Model{};
+
+    // One past maxInt(i32): the option field's own type is the bound,
+    // so the cast that used to trap is now the grid-lines teaching
+    // error. The value parses fine as a 64-bit literal — the failure
+    // must come from the attribute seam, not the expression parser.
+    var overflow_view = try InboxMarkup.init(arena, "<column>\n  <stack>\n    <text>Bold</text>\n    <tooltip anchor=\"above\" tooltip-delay=\"2147483648\">Bold the selection</tooltip>\n  </stack>\n</column>");
+    var overflow_ui = InboxUi.init(arena);
+    try testing.expectError(error.MarkupBuild, overflow_view.build(&overflow_ui, &model));
+    try testing.expectEqualStrings("expected a non-negative whole number", overflow_view.diagnostic.message);
+
+    // Boundary values pass: 0 (the instant-show escape hatch) and the
+    // type's exact max.
+    var boundary_view = try InboxMarkup.init(arena, "<column>\n  <stack>\n    <text>Bold</text>\n    <tooltip anchor=\"above\" tooltip-delay=\"0\">Bold the selection</tooltip>\n  </stack>\n  <stack>\n    <text>Link</text>\n    <tooltip anchor=\"below\" tooltip-delay=\"2147483647\">Insert a link</tooltip>\n  </stack>\n</column>");
+    var boundary_ui = InboxUi.init(arena);
+    const tree = try boundary_ui.finalize(try boundary_view.build(&boundary_ui, &model));
+    try testing.expectEqual(@as(i32, 0), findByText(tree.root, .tooltip, "Bold the selection").?.tooltip_delay_ms);
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), findByText(tree.root, .tooltip, "Insert a link").?.tooltip_delay_ms);
+}
+
+test "tooltip-delay model binding past i32 max fails the build instead of trapping" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Bindings deliver i64 model values straight into the same cast
+    // seam the literal path uses, so an out-of-range model value must
+    // produce the same teaching error — per-build, since only the
+    // value (not the document) is wrong.
+    const DelayModel = struct { delay: i64 = 0 };
+    const DelayMarkup = markup_view.MarkupView(DelayModel, Msg);
+    const source = "<column>\n  <stack>\n    <text>Bold</text>\n    <tooltip anchor=\"above\" tooltip-delay=\"{delay}\">Bold the selection</tooltip>\n  </stack>\n</column>";
+
+    var overflow_view = try DelayMarkup.init(arena, source);
+    var overflow_ui = InboxUi.init(arena);
+    const overflow_model = DelayModel{ .delay = @as(i64, std.math.maxInt(i32)) + 1 };
+    try testing.expectError(error.MarkupBuild, overflow_view.build(&overflow_ui, &overflow_model));
+    try testing.expectEqualStrings("expected a non-negative whole number", overflow_view.diagnostic.message);
+
+    // The same document lowers when the model holds an in-range value.
+    var ok_view = try DelayMarkup.init(arena, source);
+    var ok_ui = InboxUi.init(arena);
+    const ok_model = DelayModel{ .delay = 250 };
+    const tree = try ok_ui.finalize(try ok_view.build(&ok_ui, &ok_model));
+    try testing.expectEqual(@as(i32, 250), findByText(tree.root, .tooltip, "Bold the selection").?.tooltip_delay_ms);
+}
+
 test "resize-easing value vocabulary mirrors the live Easing enum" {
     // The validator's std-only mirror of the enum's member names; a new
     // member cannot ship without its markup spelling.

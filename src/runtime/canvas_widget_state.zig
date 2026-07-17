@@ -96,6 +96,40 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
             // and force-pushing the clamp into the live bounce (visible
             // jitter). Non-driver platforms clamp exactly as before.
             canvas_widget_runtime.clampCanvasWidgetLayoutScrollOffsets(reconciled_nodes[0..reconciled_layout.nodes.len], null);
+            // Runtime-owned tooltip visibility normalizes BEFORE the
+            // diff: the retained tree carries the intent machine's
+            // hidden stamps on anchored tooltips while the source
+            // declares authored visibility, so diffing them as-is
+            // reported a spurious visibility invalidation (a dirty
+            // repaint region for chrome that never changed) on EVERY
+            // rebuild containing a hidden anchored tooltip. The stamp
+            // uses the prune VERDICT against the reconciled tree — the
+            // shown id adoption will actually keep — WITHOUT mutating
+            // the live intent registers yet: everything between here
+            // and a retained tree is fallible (`diffWithTokens` can
+            // overflow its invalidation scratch, and
+            // `copyWidgetLayoutTree` rejects node/anchored-surface
+            // limits and every retained-pool budget before it resets
+            // the pools), and a register prune applied ahead of a
+            // failure left the OLD tree stamped visible with cleared
+            // registers — a tooltip no transition could ever hide
+            // again. The register mutation lands inside
+            // `copyWidgetLayoutTree`'s own prune, after the fallible
+            // steps succeed, where it applies this same verdict; an
+            // unchanged rebuild still diffs clean, a SHOWN tooltip
+            // stays visibly shown across the rebuild (no hide-then-show
+            // frame pair), and a rebuild that breaks the shown binding
+            // still diffs the hide honestly.
+            const prospective_shown_tooltip_id = self.views[index].canvasTooltipShownIdSurvivingLayout(reconciled_layout);
+            // Pre-adoption tooltip bindings for the standing hover and
+            // keyboard focus-visible owners, captured while the OLD
+            // tree is still retained (the copy below replaces it): the
+            // adoption reconcile at the bottom compares them against
+            // the adopted tree to catch a tooltip mounted/replaced/
+            // rekeyed beneath a stable owner — a change neither the
+            // hover re-hit-test nor the register prune can see.
+            const adoption_tooltip_bindings = CanvasWidgetEventMethods(Runtime).captureCanvasTooltipAdoptionBindings(self, index);
+            self.views[index].applyCanvasTooltipVisibilityToNodesForShownId(reconciled_nodes[0..reconciled_layout.nodes.len], prospective_shown_tooltip_id);
             const invalidations = try canvas.WidgetLayoutTree.diffWithTokens(previous_layout, reconciled_layout, tokens, &self.canvas_widget_invalidations_scratch);
             const previous_render_state = self.views[index].canvasWidgetRenderState();
             const next_render_state = CanvasWidgetEventMethods(Runtime).canvasWidgetRenderStateAfterLayout(previous_render_state, reconciled_layout);
@@ -152,6 +186,16 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
             // the user was looking at, and the tween walks it to the
             // declared pose one presented frame at a time.
             try applyCanvasWidgetDisclosureTweenPlan(self, index, disclosure_plan);
+            // Re-hit-test the stationary pointer against the ADOPTED
+            // tree, after every pose restore above settles the frames
+            // the user actually sees and BEFORE the display refresh
+            // publishes them: the prune at the top validates only
+            // tooltip/owner identity and hover survives by ID, so a
+            // rebuild that MOVES a same-ID trigger away from (or
+            // under) the stationary pointer must step hover ownership
+            // and the tooltip intent machine exactly like the
+            // point-blind scroll paths do.
+            try CanvasWidgetEventMethods(Runtime).reconcileCanvasWidgetInteractionAfterLayoutAdoption(self, index, adoption_tooltip_bindings);
             const requested_frame = try CanvasWidgetDisplayMethods(Runtime).refreshCanvasWidgetDisplayListIfOwned(self, index);
             if ((layout_dirty or widget_revision_changed) and !requested_frame) try CanvasFrameMethods(Runtime).requestCanvasFrameForView(self, index);
             return self.views[index].info();
@@ -266,7 +310,7 @@ pub fn RuntimeCanvasWidgetState(comptime Runtime: type) type {
 
             const dirty = try self.views[index].stepCanvasWidgetKineticScroll(dt_ms) orelse return self.views[index].info();
             const previous_cursor = self.views[index].canvas_widget_cursor;
-            self.views[index].reconcileCanvasWidgetRenderStateAfterScroll(null);
+            try CanvasWidgetEventMethods(Runtime).reconcileCanvasWidgetRenderStateAfterScrollWithTooltipIntent(self, index, null);
             if (previous_cursor != self.views[index].canvas_widget_cursor) try CanvasWidgetEventMethods(Runtime).syncCanvasWidgetCursorForView(self, index);
             try CanvasWidgetEventMethods(Runtime).invalidateForCanvasWidgetDirty(self, index, dirty);
             _ = try CanvasWidgetDisplayMethods(Runtime).refreshCanvasWidgetDisplayListIfOwned(self, index);

@@ -222,6 +222,18 @@ pub const Runtime = struct {
     next_window_id: platform.WindowId = 2,
     next_view_id: platform.ViewId = 1,
     invalidated: bool = true,
+    /// Whether the platform currently reports the app ACTIVE (frontmost
+    /// on macOS — the state the `.app_activated`/`.app_deactivated`
+    /// lifecycle events flip). Stamped in the dispatch loop from those
+    /// journaled events, so replay reproduces it deterministically.
+    /// Defaults true: a launching app is treated as active until the
+    /// platform says otherwise, because some hosts deliver input before
+    /// the first activation event and suppressing intent until one
+    /// arrived would deaden hover on hosts that never send it. The
+    /// tooltip intent machine consults this: an INACTIVE app reveals
+    /// and arms nothing — including a rebuild the app performs from its
+    /// own deactivation callback.
+    app_active: bool = true,
     /// Whether the app's stop hook (`App.stop`) has been delivered.
     /// Normally the platform's `.app_shutdown` event delivers it; the
     /// run loop's exit path checks this flag and delivers a missed stop
@@ -743,6 +755,7 @@ pub const Runtime = struct {
     const refreshCanvasWidgetDisplayList = CanvasWidgetDisplayMethods.refreshCanvasWidgetDisplayList;
 
     const CanvasWidgetEventMethods = runtime_canvas_widget_events.RuntimeCanvasWidgetEvents(Runtime);
+    pub const advanceCanvasTooltipIntentForFrame = CanvasWidgetEventMethods.advanceCanvasTooltipIntentForFrame;
     pub const routeCanvasWidgetPointerInput = CanvasWidgetEventMethods.routeCanvasWidgetPointerInput;
     pub const routeCanvasWidgetKeyboardInput = CanvasWidgetEventMethods.routeCanvasWidgetKeyboardInput;
     pub const routeCanvasWidgetTextInput = CanvasWidgetEventMethods.routeCanvasWidgetTextInput;

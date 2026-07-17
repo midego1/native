@@ -61,6 +61,10 @@ pub fn RuntimeGpuSurfaceEvents(comptime Runtime: type) type {
                 // so accordion reveals replay frame for frame exactly
                 // like split fractions do.
                 try self.advanceCanvasWidgetDisclosureTweenForFrame(index, frame_event.timestamp_ns);
+                // The anchored-tooltip hover-intent delay fires on the
+                // same recorded clock: a dwell past the delay shows its
+                // tooltip on a deterministic frame, replayed exactly.
+                try self.advanceCanvasTooltipIntentForFrame(index, frame_event.timestamp_ns);
                 try dispatchPendingCanvasWidgetScrollEvents(self, app, index);
                 // A settling tween notes its ONE split-resize event with
                 // no input in flight; drain it here so the controlled
@@ -180,6 +184,16 @@ pub fn RuntimeGpuSurfaceEvents(comptime Runtime: type) type {
                 if (runtimeFindViewIndex(self, input_event.window_id, input_event.label)) |index| {
                     self.views[index].recordGpuSurfaceInputTimestamp(input_event.timestamp_ns);
                 }
+                // The whole consumed stream still feeds the tooltip
+                // intent choke point: every pointer-carrying event
+                // updates the stored position (a later point-blind
+                // reconcile must hit-test where the pointer really is),
+                // the secondary down resets the machine before the menu
+                // presents ("pointer-down dismisses" holds for EVERY
+                // button — no tooltip floats behind or over the native
+                // menu), and a consumed cancel is still the pointer
+                // leaving the view.
+                try CanvasWidgetEventMethods().reconcileCanvasTooltipIntentForConsumedPointerInput(self, input_event);
                 if (input_event.kind == .pointer_down) {
                     try setFocusedView(self, input_event.window_id, input_event.label);
                     self.invalidated = true;
@@ -244,7 +258,17 @@ pub fn RuntimeGpuSurfaceEvents(comptime Runtime: type) type {
                 // click on the native titlebar. Dismissal above still ran:
                 // clicking the header closes an open surface first.
                 window_drag_started = try CanvasWidgetEventMethods().startCanvasWidgetWindowDragFromPointer(self, input_event, pointer_event.*);
-                if (!window_drag_started) {
+                if (window_drag_started) {
+                    // The drag consumed the down, but "pointer-down
+                    // dismisses" still holds — and the down still
+                    // carried a position the intent machine must
+                    // record: the OS owning the pointer from here must
+                    // not strand an armed or shown tooltip (the
+                    // matching up may never arrive), and a later
+                    // point-blind reconcile must hit-test where the
+                    // pointer really went down.
+                    try CanvasWidgetEventMethods().reconcileCanvasTooltipIntentForConsumedPointerInput(self, input_event);
+                } else {
                     try CanvasWidgetEventMethods().updateCanvasWidgetControlFromPointer(self, pointer_event.*);
                     try CanvasWidgetEventMethods().updateCanvasWidgetInteractionFromPointer(self, pointer_event.*);
                     // The text pass may stamp a clear edit onto the
@@ -301,6 +325,11 @@ pub fn RuntimeGpuSurfaceEvents(comptime Runtime: type) type {
             // the event (Escape's clear included), so the app dispatch
             // below hears exactly the edit the retained editor performed.
             if (widget_keyboard_event) |*keyboard_event| {
+                // Keyboard activation counts as a press for tooltips:
+                // Space/Enter on the focused trigger dismisses its
+                // armed/shown tooltip before the control mutation and
+                // app dispatch observe the input.
+                try CanvasWidgetEventMethods().updateCanvasTooltipIntentForKeyboardActivation(self, keyboard_event.*);
                 try CanvasWidgetEventMethods().updateCanvasWidgetControlFromKeyboard(self, keyboard_event.*);
                 try CanvasWidgetEventMethods().updateCanvasWidgetTextFromKeyboard(self, keyboard_event);
             }
@@ -612,10 +641,17 @@ fn setFocusedView(self: anytype, window_id: platform.WindowId, label: []const u8
     for (self.views[0..self.view_count], 0..) |*view, view_index| {
         if (view.window_id != window_id) continue;
         const previous_state = view.canvasWidgetRenderState();
+        const was_focused = view.focused;
         view.focused = std.mem.eql(u8, view.label, label);
         const next_state = view.canvasWidgetRenderState();
         if (!runtime_canvas_widget_events.RuntimeCanvasWidgetEvents(@TypeOf(self.*)).canvasWidgetRenderStatesEqual(previous_state, next_state)) {
             try runtime_canvas_widget_events.RuntimeCanvasWidgetEvents(@TypeOf(self.*)).invalidateForCanvasWidgetRenderStateChange(self, view_index, previous_state, next_state);
+        }
+        // A view losing focus drops its tooltip state and re-stamps
+        // hidden — input landing in a sibling view must not leave the
+        // blurred view's tooltip floating.
+        if (was_focused and !view.focused) {
+            try runtime_canvas_widget_events.RuntimeCanvasWidgetEvents(@TypeOf(self.*)).resetCanvasTooltipIntentForViewBlur(self, view_index);
         }
     }
     for (self.webviews[0..self.webview_count]) |*webview| {

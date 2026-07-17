@@ -3,6 +3,7 @@ const geometry = @import("geometry");
 const validation = @import("validation.zig");
 const shell_layout = @import("shell_layout.zig");
 const runtime_state = @import("state.zig");
+const runtime_canvas_widget_events = @import("canvas_widget_events.zig");
 const app_manifest = @import("app_manifest");
 const platform = @import("../platform/root.zig");
 
@@ -37,7 +38,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
         pub fn focusWindow(self: *Runtime, window_id: platform.WindowId) anyerror!void {
             const index = Self.findWindowIndexById(self, window_id) orelse return error.WindowNotFound;
             try self.options.platform.services.focusWindow(window_id);
-            Self.setFocusedIndex(self, index);
+            try Self.setFocusedIndex(self, index);
             self.invalidated = true;
         }
 
@@ -78,7 +79,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             const window_options = options.windowOptions(id, self.windows[index].info.label);
             const native_info = try self.options.platform.services.createWindow(window_options);
             native_created = true;
-            Self.applyNativeInfo(self, index, native_info);
+            try Self.applyNativeInfo(self, index, native_info);
             if (self.windows[index].source) |window_source| {
                 try self.options.platform.services.loadWindowWebView(id, window_source);
             }
@@ -131,30 +132,32 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             return copySourceInto(&self.loaded_source_storage, source);
         }
 
-        pub fn applyNativeInfo(self: *Runtime, index: usize, native_info: platform.WindowInfo) void {
+        pub fn applyNativeInfo(self: *Runtime, index: usize, native_info: platform.WindowInfo) anyerror!void {
             self.windows[index].info.frame = native_info.frame;
             self.windows[index].info.scale_factor = native_info.scale_factor;
             self.windows[index].info.open = native_info.open;
-            self.windows[index].info.focused = native_info.focused;
             if (!self.windows[index].main_frame_set) {
                 self.windows[index].main_frame = geometry.RectF.init(0, 0, native_info.frame.width, native_info.frame.height);
             }
-            if (native_info.focused) Self.setFocusedIndex(self, index);
+            if (native_info.focused)
+                try Self.setFocusedIndex(self, index)
+            else
+                try Self.setWindowFocused(self, index, false);
         }
 
         pub fn updateWindowState(self: *Runtime, state: platform.WindowState) !void {
             const existing_index = Self.findWindowIndexById(self, state.id);
             const index = existing_index orelse try Self.reserveWindow(self, state.id, state.label, state.title, null, true);
-            var info = self.windows[index].info;
-            info.frame = state.frame;
-            info.scale_factor = state.scale_factor;
-            info.open = state.open;
-            info.focused = state.focused;
-            self.windows[index].info = info;
+            self.windows[index].info.frame = state.frame;
+            self.windows[index].info.scale_factor = state.scale_factor;
+            self.windows[index].info.open = state.open;
             if (!self.windows[index].main_frame_set) {
                 self.windows[index].main_frame = geometry.RectF.init(0, 0, state.frame.width, state.frame.height);
             }
-            if (state.focused) Self.setFocusedIndex(self, index);
+            if (state.focused)
+                try Self.setFocusedIndex(self, index)
+            else
+                try Self.setWindowFocused(self, index, false);
         }
 
         pub fn runtimeWindowStateForPersistence(self: *const Runtime, state: platform.WindowState) platform.WindowState {
@@ -224,9 +227,52 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
             self.shell_layout_count -= 1;
         }
 
-        pub fn setFocusedIndex(self: *Runtime, focused_index: usize) void {
-            for (self.windows[0..self.window_count], 0..) |*window, index| {
-                window.info.focused = index == focused_index;
+        /// THE window-key seam: every path that moves key-window status
+        /// — the platform's `window_focused` event, a frame-change echo
+        /// carrying `focused`, the app's own `focusWindow`, and native
+        /// adoption at creation — lands here, so the key-LOSS
+        /// consequence cannot be skipped by feeding only one ingress.
+        /// A window that transitions focused→unfocused drops the
+        /// tooltip conversation in all of its canvas views (the
+        /// `.view_blur` contract: focus-shown and pointer-owned alike
+        /// hide and re-stamp hidden); `view.focused` itself is
+        /// deliberately untouched so per-window focus memory survives
+        /// and the re-key restores focus where it was without revealing
+        /// anything.
+        pub fn setFocusedIndex(self: *Runtime, focused_index: usize) anyerror!void {
+            for (0..self.window_count) |index| {
+                try Self.setWindowFocused(self, index, index == focused_index);
+            }
+        }
+
+        /// The ONE writer of a tracked window's `focused` flag: the
+        /// key-LOSS consequence fires on the flag's own focused→
+        /// unfocused edge, HERE, so it cannot depend on which platform
+        /// event carried the loss or in what order. macOS announces a
+        /// key change as one GAIN (`window_focused`), and the dethroning
+        /// loop in `setFocusedIndex` observes the old window's edge —
+        /// but Windows and GTK announce the LOSS first (a state echo
+        /// carrying `focused = false` for the window the user left,
+        /// before any gain for the next one), and a loss written past
+        /// this seam would leave the later gain nothing to observe:
+        /// the tooltip stayed painted, and a11y-visible, in the
+        /// inactive window. Callers pass the flag they were told;
+        /// the transition logic lives only here.
+        ///
+        /// The two writes that deliberately stay OUTSIDE the seam:
+        /// `reserveWindow`'s creation-time init (a fresh slot has no
+        /// prior state — no edge exists) and `closeWindow`'s
+        /// transactional flip in window_views.zig (its views are
+        /// removed with the window on success, so there is no tooltip
+        /// left to reset, and its rollback on platform failure must
+        /// not have fired one).
+        pub fn setWindowFocused(self: *Runtime, index: usize, focused: bool) anyerror!void {
+            const CanvasWidgetEventMethods = runtime_canvas_widget_events.RuntimeCanvasWidgetEvents(Runtime);
+            const window = &self.windows[index];
+            const was_focused = window.info.focused;
+            window.info.focused = focused;
+            if (was_focused and !focused) {
+                try CanvasWidgetEventMethods.resetCanvasTooltipIntentForWindowKeyLoss(self, window.info.id);
             }
         }
 

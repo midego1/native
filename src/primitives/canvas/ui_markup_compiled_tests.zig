@@ -479,6 +479,133 @@ test "compiled split tween pair lowers into the layout-tween declaration identic
     try testing.expectEqual(interpreted_split.value, compiled_split.value);
 }
 
+// ---------------------------------------- anchored-tooltip intent parity
+
+const tooltip_intent_markup =
+    \\<column gap="12">
+    \\  <stack>
+    \\    <text>Bold</text>
+    \\    <tooltip anchor="above" tooltip-delay="250">Bold the selection</tooltip>
+    \\  </stack>
+    \\  <stack>
+    \\    <text>Link</text>
+    \\    <tooltip anchor="below" anchor-offset="8">Insert a link</tooltip>
+    \\  </stack>
+    \\  <tooltip>Copied!</tooltip>
+    \\</column>
+;
+
+const TooltipIntentCompiled = canvas.CompiledMarkupView(EntriesModel, EntriesMsg, tooltip_intent_markup);
+
+test "compiled anchored tooltips stamp the hover-intent declaration identically to the interpreter" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const entries = [_]Entry{.{ .id = 11, .label = "first" }};
+    const model = EntriesModel{ .entries = &entries };
+
+    var view = try markup_view.MarkupView(EntriesModel, EntriesMsg).init(arena, tooltip_intent_markup);
+    var interpreter_ui = EntriesUi.init(arena);
+    const interpreted = try interpreter_ui.finalize(try view.build(&interpreter_ui, &model));
+    var compiled_ui = EntriesUi.init(arena);
+    const compiled = try compiled_ui.finalize(TooltipIntentCompiled.build(&compiled_ui, &model));
+    try expectSameTree(EntriesMsg, interpreted, compiled);
+
+    // Both engines stamp the declaration the runtime's hover-intent
+    // machine reads: the anchor floats the leaf against its parent, and
+    // tooltip-delay overrides the token default (-1 keeps it). The bare
+    // static tooltip keeps null anchor and the -1 default, so existing
+    // documents lower byte-identically.
+    inline for (.{ interpreted.root, compiled.root }) |root| {
+        const declared = fixture.findByText(root, .tooltip, "Bold the selection").?;
+        try testing.expectEqual(@as(i32, 250), declared.tooltip_delay_ms);
+        try testing.expectEqual(canvas.WidgetAnchorPlacement.above, declared.layout.anchor.?.placement);
+
+        const defaulted = fixture.findByText(root, .tooltip, "Insert a link").?;
+        try testing.expectEqual(@as(i32, -1), defaulted.tooltip_delay_ms);
+        try testing.expectEqual(canvas.WidgetAnchorPlacement.below, defaulted.layout.anchor.?.placement);
+        try testing.expectEqual(@as(f32, 8), defaulted.layout.anchor.?.offset);
+
+        const static = fixture.findByText(root, .tooltip, "Copied!").?;
+        try testing.expectEqual(@as(i32, -1), static.tooltip_delay_ms);
+        try testing.expectEqual(@as(?canvas.WidgetAnchor, null), static.layout.anchor);
+    }
+}
+
+// ------------------------------------------- tooltip-delay range guard
+
+const TooltipDelayModel = struct { delay: i64 = 0 };
+
+const tooltip_delay_binding_markup =
+    \\<stack>
+    \\  <text>Bold</text>
+    \\  <tooltip anchor="above" tooltip-delay="{delay}">Bold the selection</tooltip>
+    \\</stack>
+;
+
+const tooltip_delay_boundary_markup =
+    \\<column gap="12">
+    \\  <stack>
+    \\    <text>Bold</text>
+    \\    <tooltip anchor="above" tooltip-delay="0">Bold the selection</tooltip>
+    \\  </stack>
+    \\  <stack>
+    \\    <text>Link</text>
+    \\    <tooltip anchor="below" tooltip-delay="2147483647">Insert a link</tooltip>
+    \\  </stack>
+    \\</column>
+;
+
+const tooltip_delay_overflow_literal_markup =
+    \\<stack>
+    \\  <text>Bold</text>
+    \\  <tooltip anchor="above" tooltip-delay="2147483648">Bold the selection</tooltip>
+    \\</stack>
+;
+
+const TooltipDelayUi = canvas.Ui(EntriesMsg);
+const TooltipDelayBindingCompiled = canvas.CompiledMarkupView(TooltipDelayModel, EntriesMsg, tooltip_delay_binding_markup);
+const TooltipDelayBoundaryCompiled = canvas.CompiledMarkupView(TooltipDelayModel, EntriesMsg, tooltip_delay_boundary_markup);
+const TooltipDelayOverflowLiteralCompiled = canvas.CompiledMarkupView(TooltipDelayModel, EntriesMsg, tooltip_delay_overflow_literal_markup);
+
+test "compiled tooltip-delay past i32 max fails the build instead of trapping" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A literal one past maxInt(i32): the option field's own type is
+    // the bound (the grid-lines pattern), so the cast that used to
+    // trap latches the failed build the interpreter's teaching error
+    // mirrors, and finalize surfaces it.
+    var literal_ui = TooltipDelayUi.init(arena);
+    const literal_node = TooltipDelayOverflowLiteralCompiled.build(&literal_ui, &TooltipDelayModel{});
+    try testing.expect(literal_ui.failed);
+    try testing.expectError(error.OutOfMemory, literal_ui.finalize(literal_node));
+
+    // Bindings deliver i64 model values into the same cast seam, so an
+    // out-of-range model value fails the same way — per-build, since
+    // only the value (not the document) is wrong.
+    var overflow_ui = TooltipDelayUi.init(arena);
+    const overflow_model = TooltipDelayModel{ .delay = @as(i64, std.math.maxInt(i32)) + 1 };
+    const overflow_node = TooltipDelayBindingCompiled.build(&overflow_ui, &overflow_model);
+    try testing.expect(overflow_ui.failed);
+    try testing.expectError(error.OutOfMemory, overflow_ui.finalize(overflow_node));
+
+    // The same document lowers when the model holds an in-range value.
+    var ok_ui = TooltipDelayUi.init(arena);
+    const ok_model = TooltipDelayModel{ .delay = 250 };
+    const ok_tree = try ok_ui.finalize(TooltipDelayBindingCompiled.build(&ok_ui, &ok_model));
+    try testing.expectEqual(@as(i32, 250), fixture.findByText(ok_tree.root, .tooltip, "Bold the selection").?.tooltip_delay_ms);
+
+    // Boundary values pass: 0 (the instant-show escape hatch) and the
+    // type's exact max.
+    var boundary_ui = TooltipDelayUi.init(arena);
+    const boundary_tree = try boundary_ui.finalize(TooltipDelayBoundaryCompiled.build(&boundary_ui, &TooltipDelayModel{}));
+    try testing.expectEqual(@as(i32, 0), fixture.findByText(boundary_tree.root, .tooltip, "Bold the selection").?.tooltip_delay_ms);
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), fixture.findByText(boundary_tree.root, .tooltip, "Insert a link").?.tooltip_delay_ms);
+}
+
 // --------------------- multi-child for bodies and the for-empty else
 
 const multi_entries_markup =

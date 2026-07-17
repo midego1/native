@@ -549,6 +549,26 @@ pub const ControlMetricTokens = struct {
     /// cycle is part of the register's identity, and reduced motion
     /// already gates the loop through `MotionTokens` upstream.
     spinner_period_ms: u32 = 1000,
+    /// Hover-intent show delay for ANCHORED tooltips, in milliseconds:
+    /// the runtime shows an anchored tooltip only after its trigger has
+    /// been hovered this long on the recorded frame clock, so sweeping
+    /// a dense toolbar never flashes every tooltip. Per-tooltip markup
+    /// (`tooltip-delay=`) and the builder (`tooltip_delay:`) override
+    /// it; 0 shows the instant the trigger is hovered. Kept with the
+    /// behavior metrics (like `spinner_period_ms`) because hover intent
+    /// is part of the tooltip register's identity, not the motion
+    /// ladder. 600ms is shadcn's Base UI-backed default trigger delay.
+    tooltip_show_delay_ms: u32 = 600,
+    /// The shared warm window after a pointer-hovered tooltip hides on
+    /// pointer leave (focus departure, Escape, presses, and view blur
+    /// deliberately do not warm): moving
+    /// to another tooltip trigger within this many milliseconds shows
+    /// its tooltip immediately (no delay) and re-warms on the next
+    /// hide — the skip-delay polish that makes sweeping a toolbar of
+    /// already-explained controls feel right. View-wide by design, not
+    /// per-tooltip: the warmth belongs to the pointer, not the widget.
+    /// 400ms is shadcn's Base UI-backed default provider timeout.
+    tooltip_warm_window_ms: u32 = 400,
 };
 
 pub const ShadowToken = struct {
@@ -1197,6 +1217,8 @@ pub const ControlMetricTokenOverrides = struct {
     spinner_segment_radius_ratio: ?f32 = null,
     spinner_tail_opacity: ?f32 = null,
     spinner_period_ms: ?u32 = null,
+    tooltip_show_delay_ms: ?u32 = null,
+    tooltip_warm_window_ms: ?u32 = null,
 
     pub fn apply(self: ControlMetricTokenOverrides, base: ControlMetricTokens) ControlMetricTokens {
         return applyFlatTokenOverrides(ControlMetricTokens, base, self);

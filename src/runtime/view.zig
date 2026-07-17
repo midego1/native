@@ -425,8 +425,85 @@ pub const RuntimeView = struct {
     scroll_driver_count: usize = 0,
     canvas_widget_focused_id: canvas.ObjectId = 0,
     canvas_widget_focus_visible_id: canvas.ObjectId = 0,
+    /// True when `canvas_widget_focus_visible_id` was written by the
+    /// KEYBOARD focus contract (`setCanvasWidgetFocusFromKeyboard`) —
+    /// the one focus path that reveals tooltips. Every other
+    /// focus-visible writer stamps false: pointer focus on editables
+    /// (the caret contract), programmatic/automation focus, the
+    /// automation key escalation on plain list rows, and the rebuild
+    /// and dismissal focus-return seams — all of which deliberately
+    /// skip the reveal (Base UI's focus-visible guard against
+    /// click-focus opens, and the reveals-are-transition-edges rule).
+    /// The layout-adoption reconcile reads this to decide whether a
+    /// tooltip newly bound beneath the standing focus-visible owner
+    /// inherits the keyboard's immediate reveal or must wait for the
+    /// next real focus arrival.
+    canvas_widget_focus_visible_keyboard: bool = false,
     canvas_widget_hovered_id: canvas.ObjectId = 0,
     canvas_widget_pressed_id: canvas.ObjectId = 0,
+    /// Hover-intent state for ANCHORED tooltips — runtime-owned
+    /// presentation chrome; the model never hears hover. `armed` is
+    /// the tooltip whose trigger is hovered while its show delay runs;
+    /// `shown` is the tooltip currently painted; `warm_until` is the
+    /// shared warm window after a pointer-hovered tooltip hides on
+    /// pointer leave (reaching another
+    /// trigger before it passes shows that tooltip immediately, the
+    /// dense-toolbar polish). Every timestamp lives on the RECORDED
+    /// input/frame clock (`canvasRenderAnimationStartNsForView` at
+    /// pointer dispatch, `GpuSurfaceFrameEvent.timestamp_ns` at frame
+    /// advance — never a wall clock), so a recorded hover-dwell
+    /// session replays its tooltip show/hide frames byte-identically.
+    canvas_tooltip_armed_id: canvas.ObjectId = 0,
+    canvas_tooltip_deadline_ns: u64 = 0,
+    canvas_tooltip_shown_id: canvas.ObjectId = 0,
+    canvas_tooltip_warm_until_ns: u64 = 0,
+    /// The TRIGGER each intent slot was earned through (the hover
+    /// target that armed the delay / the widget whose hover or
+    /// focus-visible showed the tooltip). Ownership is a live claim,
+    /// not a memento: a rebuild that removes, rekeys, disables, or
+    /// re-parents the owner invalidates the slot in
+    /// `pruneCanvasTooltipIntent` — the tooltip node alone surviving
+    /// is not enough to keep explaining a control that no longer
+    /// exists.
+    canvas_tooltip_armed_owner_id: canvas.ObjectId = 0,
+    canvas_tooltip_shown_owner_id: canvas.ObjectId = 0,
+    /// The pointer's last position while it held the shown tooltip —
+    /// on the owning trigger (seeded at arm/show) or inside the shown
+    /// tooltip's own frame. It is the apex of the transit corridor
+    /// (`canvasTooltipTravelRegionContains`) a leave-move is judged
+    /// against, so the corridor always fans out from where the pointer
+    /// actually left. Meaningful only while a pointer-shown tooltip is
+    /// up; every value it is compared against comes from journaled
+    /// pointer events, so replay sees identical corridors.
+    canvas_tooltip_pointer_from: geometry.PointF = geometry.PointF.zero(),
+    /// Nonzero while the pointer has left both the trigger and the
+    /// shown tooltip's frame but is still inside the transit corridor
+    /// between them: the deadline (recorded clock) by which it must
+    /// arrive. Each in-corridor move re-arms it, so slow deliberate
+    /// transits stay open (WCAG 1.4.13 hoverable content) while a
+    /// pointer that parks in the gap resolves deterministically on the
+    /// frame clock. 0 means no transit is in flight.
+    canvas_tooltip_transit_deadline_ns: u64 = 0,
+    /// True when the shown tooltip was revealed by keyboard
+    /// focus-visible rather than pointer hover. Focus-shown tooltips
+    /// follow shadcn's Base UI-backed defaults: they open instantly on
+    /// focus-visible, hide on blur, ignore pointer hover leaving OTHER
+    /// triggers, and never open the pointer's warm window when they
+    /// hide (deliberate keyboard motion is not a pointer sweep).
+    canvas_tooltip_shown_from_focus: bool = false,
+    /// The pointer's last JOURNALED position over this view — every
+    /// phase that carries a trustworthy point (hover, move, down, up,
+    /// wheel) updates it; null before the first pointer event and after
+    /// a `.cancel` (the pointer-exit AppKit/GTK/Win32 hosts emit, and
+    /// gesture cancels). Point-blind scroll reconciliation (kinetic
+    /// steps, native drivers, keyboard scrolling) re-hit-tests this
+    /// position against the post-scroll tree — the pointer did not
+    /// move, so where it last stood is where it still is — and a null
+    /// here means those paths must CLOSE pointer tooltip intent rather
+    /// than guess (see
+    /// reconcileCanvasWidgetRenderStateAfterScrollWithTooltipIntent).
+    /// Journaled input only, so replay sees identical positions.
+    canvas_last_pointer_position: ?geometry.PointF = null,
     /// Pointer position while the hovered widget draws hover-detail
     /// chrome (a `.chart` with hover details opted in); null everywhere
     /// else. Feeds `WidgetRenderState.hover_point`, so the display list
@@ -612,6 +689,15 @@ pub const RuntimeView = struct {
     pub const canvasWidgetDismissibleSurfaceIndexForTarget = CanvasWidgetTreeMethods.canvasWidgetDismissibleSurfaceIndexForTarget;
     pub const canvasWidgetAnchoredDismissibleChildIndex = CanvasWidgetTreeMethods.canvasWidgetAnchoredDismissibleChildIndex;
     pub const canvasWidgetOwnedMenuSurfaceIndex = CanvasWidgetTreeMethods.canvasWidgetOwnedMenuSurfaceIndex;
+    pub const canvasWidgetOwnedTooltipIndex = CanvasWidgetTreeMethods.canvasWidgetOwnedTooltipIndex;
+    pub const canvasWidgetOwnedTooltipIdForOwner = CanvasWidgetTreeMethods.canvasWidgetOwnedTooltipIdForOwner;
+    pub const applyCanvasTooltipVisibility = CanvasWidgetTreeMethods.applyCanvasTooltipVisibility;
+    pub const applyCanvasTooltipVisibilityToNodes = CanvasWidgetTreeMethods.applyCanvasTooltipVisibilityToNodes;
+    pub const applyCanvasTooltipVisibilityToNodesForShownId = CanvasWidgetTreeMethods.applyCanvasTooltipVisibilityToNodesForShownId;
+    pub const pruneCanvasTooltipIntent = CanvasWidgetTreeMethods.pruneCanvasTooltipIntent;
+    pub const pruneCanvasTooltipIntentForLayout = CanvasWidgetTreeMethods.pruneCanvasTooltipIntentForLayout;
+    pub const canvasTooltipShownIdSurvivingLayout = CanvasWidgetTreeMethods.canvasTooltipShownIdSurvivingLayout;
+    pub const canvasTooltipIntentArmed = CanvasWidgetTreeMethods.canvasTooltipIntentArmed;
     pub const canvasWidgetMenuSurfaceEntryId = CanvasWidgetTreeMethods.canvasWidgetMenuSurfaceEntryId;
     pub const canvasWidgetAnchorTriggerFocusId = CanvasWidgetTreeMethods.canvasWidgetAnchorTriggerFocusId;
     pub const canvasWidgetTopmostAnchoredDismissibleIndex = CanvasWidgetTreeMethods.canvasWidgetTopmostAnchoredDismissibleIndex;
