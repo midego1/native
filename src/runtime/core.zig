@@ -178,6 +178,17 @@ pub const DispatchErrorPolicy = enum { degrade, propagate };
 
 pub const Runtime = struct {
     options: Options,
+    /// The allocator that owns every runtime-lifetime heap registration
+    /// (today: registered canvas font bytes). Captured from
+    /// `Options.allocator` at init precisely because `options` is public
+    /// and mutable: allocation and free of owned storage can be a whole
+    /// runtime lifetime apart, and they must resolve through ONE
+    /// allocator identity. Mutating `options.allocator` on a live
+    /// runtime does not retarget this — bytes are always returned to the
+    /// allocator that made them. Every on-demand owner (registration
+    /// allocs, refusal-path frees, the `deinit` frees) goes through this
+    /// field, never through `options.allocator`.
+    owned_allocator: std.mem.Allocator,
     surface: platform.Surface,
     appearance: platform.Appearance = .{},
     windows: [platform.max_windows]RuntimeWindow = undefined,
@@ -355,13 +366,16 @@ pub const Runtime = struct {
     canvas_image_pixels: [canvas_limits.max_registered_canvas_images][canvas_limits.max_registered_canvas_image_pixel_bytes]u8 = undefined,
     canvas_image_resources_scratch: [canvas_limits.max_registered_canvas_images]canvas.ReferenceImage = undefined,
     /// Runtime-registered canvas fonts (see canvas_fonts.zig): entry
-    /// metadata, the per-slot TrueType byte pool with parsed face views
-    /// over it, the `ReferenceFont` scratch the frame planner hands to
-    /// renderers, and the font-aware measure provider installed on first
-    /// registration for platforms without host-side text measurement.
+    /// metadata carrying each face's heap-owned TrueType bytes (exact
+    /// file size, allocated from the init-frozen `owned_allocator` at
+    /// registration —
+    /// zero fonts cost zero bytes; freed only by `deinit`, registration
+    /// being permanent), parsed face views over those bytes, the
+    /// `ReferenceFont` scratch the frame planner hands to renderers, and
+    /// the font-aware measure provider installed on first registration
+    /// for platforms without host-side text measurement.
     canvas_font_entries: [canvas_limits.max_registered_canvas_fonts]runtime_canvas_fonts.CanvasFontEntry = [_]runtime_canvas_fonts.CanvasFontEntry{.{}} ** canvas_limits.max_registered_canvas_fonts,
     canvas_font_count: usize = 0,
-    canvas_font_bytes: [canvas_limits.max_registered_canvas_fonts][canvas_limits.max_registered_canvas_font_bytes]u8 = undefined,
     canvas_font_faces: [canvas_limits.max_registered_canvas_fonts]canvas.font_ttf.Face = undefined,
     canvas_font_resources_scratch: [canvas_limits.max_registered_canvas_fonts]canvas.ReferenceFont = undefined,
     canvas_font_measure_provider: canvas.TextMeasureProvider = .{ .measure_fn = runtime_canvas_fonts.unboundCanvasFontMeasure },
@@ -388,6 +402,10 @@ pub const Runtime = struct {
             }
         }
         self.options = options;
+        // Freeze the ownership allocator now (see the field doc):
+        // `options` stays publicly mutable, but the identity that owns
+        // on-demand registrations must not move under live allocations.
+        self.owned_allocator = options.allocator;
         self.surface = options.platform.surface();
         // The profile rings exceed the small-default copy bound above;
         // assign explicitly so the disabled state is never undefined.
@@ -407,6 +425,26 @@ pub const Runtime = struct {
         // (tests do constantly): bump the generation so nothing measured
         // against a previous runtime's provider can be served to this one.
         canvas.bumpTextMeasureGeneration();
+    }
+
+    /// Release the runtime's heap-owned registrations (registered canvas
+    /// font bytes, allocated on demand from the init-frozen
+    /// `owned_allocator`). Ends the runtime's life: parsed faces, atlas
+    /// keys, and measure providers referencing those bytes are invalid
+    /// past this point. Process-lifetime embeddings (the app runner) may
+    /// skip it — the default allocator's pages die with the process —
+    /// but embedders that create and destroy runtimes in one process
+    /// (tests, the docs wasm preview host) call it to return the font
+    /// bytes.
+    pub fn deinit(self: *Runtime) void {
+        for (self.canvas_font_entries[0..self.canvas_font_count]) |entry| {
+            // Through the frozen identity, never `options.allocator`:
+            // an embedder may have swapped the public option since these
+            // bytes were made, and a free must hit the allocator that
+            // allocated.
+            self.owned_allocator.free(entry.bytes);
+        }
+        self.canvas_font_count = 0;
     }
 
     fn fieldHasSmallDefault(comptime field: std.builtin.Type.StructField) bool {
@@ -837,6 +875,7 @@ pub fn TestHarness() type {
         }
 
         pub fn destroy(self: *Self, gpa: std.mem.Allocator) void {
+            self.runtime.deinit();
             gpa.destroy(self);
         }
 
@@ -846,6 +885,11 @@ pub fn TestHarness() type {
             Runtime.initAt(&self.runtime, .{
                 .platform = self.null_platform.platform(),
                 .trace_sink = self.trace_sink.sink(),
+                // Registered-font bytes route through the leak-checked
+                // test allocator (freed by `destroy` via Runtime.deinit),
+                // so a registration that leaks fails the test that made
+                // it.
+                .allocator = if (builtin.is_test) std.testing.allocator else std.heap.page_allocator,
                 // Real-executor effect tests spawn processes that must
                 // see the parent environment (HOME, PATH), exactly as
                 // the app runner threads it from `std.process.Init`.

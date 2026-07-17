@@ -116,15 +116,26 @@ pub const max_registered_canvas_image_pixel_bytes: usize = 1024 * 1024;
 // so re-registering an id with different bytes would serve stale glyphs —
 // re-use of a registered id fails loudly instead (`error.FontIdInUse`).
 // The slot count covers a real brand set (a text family in 2-3 weights
-// plus a display and a mono face); the per-font bound fits full
-// static-instance UI faces (the bundled faces are 71/116 KB; a large
-// Latin+Cyrillic+Greek UI face is a few hundred KB) while refusing
-// multi-megabyte CJK/variable fonts the glyph pipeline is not sized for.
-// Memory is fixed-capacity address space in the Runtime: 8 x 2 MiB =
-// 16 MiB, pages touched only as fonts register; oversized files and a
-// ninth font fail loudly (`error.FontTooLarge` / `error.FontRegistryFull`).
+// plus a display and a mono face); the per-font bound fits full CJK
+// faces — the glyph pipeline is sized for them (canvas.font_ttf budgets)
+// and the canonical Google Fonts TrueType builds measure 9.6 MB (Noto
+// Sans JP), 10.4 (KR), 11.9 (TC), 13.6 (Noto Serif JP), and 17.8 (Noto
+// Sans SC), so 24 MiB covers the largest measured with ~1.4x headroom.
+// Latin UI faces stay a few hundred KB (the bundled faces are 71/116 KB).
+// Both bounds are VALIDATION bounds, not storage reservations: the
+// registry heap-allocates each font's exact file size from the
+// allocator the runtime froze at init (`Options.allocator`, captured
+// into `Runtime.owned_allocator`) at registration (canvas_fonts.zig), so
+// a runtime with no registered fonts carries zero font bytes. An
+// embedded slot pool at this bound would put 8 x 24 MiB = 192 MiB in
+// EVERY Runtime — measured on the docs wasm preview host (one Runtime
+// per component tile, wasm linear memory never overcommits) as 137.5 ->
+// 313.5 MB per instance before any font registered. Oversized files and
+// a ninth font fail loudly (`error.FontTooLarge` /
+// `error.FontRegistryFull`). The gpu-surface registration side-channel
+// bound (`platform.max_gpu_surface_font_bytes`) pins the same value.
 pub const max_registered_canvas_fonts: usize = 8;
-pub const max_registered_canvas_font_bytes: usize = 2 * 1024 * 1024;
+pub const max_registered_canvas_font_bytes: usize = 24 * 1024 * 1024;
 
 // The retained widget-tree budgets (raised 256 -> 1024; see the header
 // comment). `automation.snapshot.max_widgets_per_view`
