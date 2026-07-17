@@ -284,6 +284,70 @@ pub fn RuntimeAutomationWidgetDispatch(comptime Runtime: type) type {
             } });
         }
 
+        /// Drive a trackpad pinch through the real platform-event path:
+        /// `pinch_begin`, one `pinch_change` carrying `scale - 1` (so
+        /// the cumulative product of `1 + delta` lands exactly on the
+        /// commanded scale — the gesture's FINAL multiplicative zoom),
+        /// and `pinch_end`, all at the same anchor point. A scale so
+        /// small its f32 delta rounds to -1 (factor 0 on the wire) is
+        /// refused as `PinchScaleBelowWireMinimum` — see the guard
+        /// below for the named minimum.
+        /// Plain input synthesis, the `widget-key` discipline: every
+        /// event journals as itself and replays through the same
+        /// dispatch — no accessibility-action record, because pinch is
+        /// not a widget verb (it never routes into the widget tree; the
+        /// app hears it through the pinch channel).
+        pub fn dispatchAutomationWidgetPinch(self: *Runtime, app: runtime_api.App(Runtime), pinch: automation_commands.AutomationWidgetPinch) anyerror!void {
+            const view_index = try automationGpuSurfaceViewIndexByLabel(self, pinch.view_label);
+            const window_id = self.views[view_index].window_id;
+            const label = self.views[view_index].label;
+            const point = pinch.point orelse geometry.PointF.init(
+                self.views[view_index].gpu_size.width / 2,
+                self.views[view_index].gpu_size.height / 2,
+            );
+            // The wire delta is `scale - 1` in f32, and f32 rounding can
+            // betray the parser's `scale > 0` guard: any scale at or
+            // below 2^-25 rounds the difference to exactly -1
+            // (ties-to-even at the halfway point), which would put the
+            // factor `1 + delta = 0` on the wire — a zoom through zero
+            // scale, which no gesture can perform and no downstream
+            // product can recover from. The invariant is the WIRE's
+            // (every emitted factor stays > 0), so validate the computed
+            // delta, not the input; the minimum accepted scale is the
+            // smallest f32 above 2^-25 (~2.9802326e-8), whose delta
+            // rounds to -1 + 2^-24 — the smallest positive factor the
+            // wire can carry. Refused before anything dispatches, so no
+            // partial gesture reaches the journal.
+            const delta = pinch.scale - 1;
+            if (1 + delta <= 0) return error.PinchScaleBelowWireMinimum;
+            const timestamp_ns = automationInputTimestampNs();
+            try self.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+                .window_id = window_id,
+                .label = label,
+                .kind = .pinch_begin,
+                .timestamp_ns = timestamp_ns,
+                .x = point.x,
+                .y = point.y,
+            } });
+            try self.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+                .window_id = window_id,
+                .label = label,
+                .kind = .pinch_change,
+                .timestamp_ns = timestamp_ns,
+                .x = point.x,
+                .y = point.y,
+                .scale = delta,
+            } });
+            try self.dispatchPlatformEvent(app, .{ .gpu_surface_input = .{
+                .window_id = window_id,
+                .label = label,
+                .kind = .pinch_end,
+                .timestamp_ns = timestamp_ns,
+                .x = point.x,
+                .y = point.y,
+            } });
+        }
+
         pub fn dispatchAutomationWidgetPointerDrag(self: *Runtime, app: runtime_api.App(Runtime), drag: AutomationWidgetPointerDrag) anyerror!void {
             const view_index = try automationWidgetTargetViewIndex(self, drag.target);
             const layout = self.views[view_index].widgetLayoutTree();

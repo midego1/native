@@ -569,6 +569,7 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 @property(nonatomic, assign) double pendingScrollDriverOffsetY;
 @property(nonatomic, assign) uint64_t scrollDriverEventLastEmitNs;
 @property(nonatomic, assign) BOOL controlClickActive;
+@property(nonatomic, assign) BOOL pinchGestureActive;
 - (void)configureWithHost:(NativeSdkAppKitHost *)host windowId:(uint64_t)windowId label:(NSString *)label;
 - (BOOL)isAvailable;
 - (void)updateDrawableSize;
@@ -613,6 +614,8 @@ static NSMutableDictionary *NativeSdkCredentialQuery(NSString *service, NSString
 - (void)emitQueuedPointerMotionInputEvent;
 - (void)queueScrollInputEvent:(NSEvent *)event deltaX:(double)deltaX deltaY:(double)deltaY;
 - (void)emitQueuedScrollInputEvent;
+- (void)emitPinchInputEventWithKind:(NSInteger)kind event:(NSEvent *)event magnification:(double)magnification;
+- (void)emitPinchChangeForEvent:(NSEvent *)event;
 - (void)emitInputEventWithKind:(NSInteger)kind point:(NSPoint)point timestampNs:(uint64_t)timestampNs modifiers:(uint32_t)modifiers keyText:(NSString *)keyText inputText:(NSString *)inputText button:(NSInteger)button deltaX:(double)deltaX deltaY:(double)deltaY;
 - (void)emitSyntheticKeyDownWithKey:(NSString *)key modifiers:(uint32_t)modifiers;
 - (void)updateSurfaceTrackingArea;
@@ -5530,6 +5533,80 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
     [self queueScrollInputEvent:event deltaX:-event.scrollingDeltaX deltaY:-event.scrollingDeltaY];
 }
 
+- (void)magnifyWithEvent:(NSEvent *)event {
+    // Trackpad pinch, phase-explicit. A cancelled gesture folds into
+    // PINCH_END: pinch delivers incremental deltas the app applies as
+    // they arrive, so there is no un-committed transient to roll back
+    // the way pointer_cancel rolls back an in-flight press —
+    // cancellation just means "the delta stream stops here".
+    //
+    // Change deltas emit uncoalesced (no per-frame queue like scroll):
+    // the cumulative gesture scale is the PRODUCT of (1 + delta), and
+    // summing coalesced deltas would drift from what the fingers did.
+    //
+    // HOW TO READ NSEvent.magnification — settled; do not "fix" again.
+    // Apple's documentation contradicts itself: the NSEvent API
+    // reference's prose says to ADD each event's magnification to your
+    // scale factor, while Apple's own Event Handling Guide example
+    // MULTIPLIES (currentSize *= 1 + event.magnification). The de facto
+    // platform behavior is what the browser engines ship, and every
+    // engine reads raw magnification as the MULTIPLICATIVE per-event
+    // delta:
+    //   - WebKit, ViewGestureControllerMac.mm:
+    //       m_magnification += m_magnification * scaleWithResistance;
+    //     i.e. zoom *= 1 + event.magnification, per event.
+    //   - Chromium's mac gesture-event builder emits
+    //       pinch_update.scale = event.magnification + 1.0;
+    //     compounded multiplicatively downstream.
+    // Ruling: raw event.magnification IS the multiplicative per-event
+    // delta. This handler forwards it untransformed (per-event floor
+    // aside — see emitPinchChangeForEvent:), and the app-side product
+    // of (1 + scale) is the zoom users already experience for the same
+    // gesture in Safari and Chrome. Do NOT reintroduce a running-sum
+    // "additive normalization" here: it matches neither Apple's example
+    // nor any engine — a raw +0.25, +0.20 stream must land on
+    // 1.25 * 1.20 = 1.5, where a sum-normalized stream lands on 1.45.
+    //
+    // EVERY magnifyWithEvent: carries the magnification since the
+    // previous event — the terminal (Ended/Cancelled) one included —
+    // so each branch below must forward a nonzero magnification as a
+    // PINCH_CHANGE or the cumulative product diverges from what the
+    // OS delivered.
+    const NSEventPhase phase = event.phase;
+    if (phase & NSEventPhaseBegan) {
+        [self emitQueuedPointerMotionInputEvent];
+        self.pinchGestureActive = YES;
+        [self emitPinchInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_PINCH_BEGIN event:event magnification:0];
+        [self emitPinchChangeForEvent:event];
+        return;
+    }
+    if (phase & NSEventPhaseChanged) {
+        if (!self.pinchGestureActive) {
+            // A gesture already in flight when this view became the
+            // hit target skips Began; open the stream cleanly anyway.
+            self.pinchGestureActive = YES;
+            [self emitPinchInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_PINCH_BEGIN event:event magnification:0];
+        }
+        [self emitPinchChangeForEvent:event];
+        return;
+    }
+    if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
+        if (!self.pinchGestureActive) return;
+        self.pinchGestureActive = NO;
+        // The terminal event's nonzero magnification emits as a final
+        // PINCH_CHANGE before the end marker (a zero-magnification
+        // terminal event emits only PINCH_END). Cancelled takes the
+        // same path deliberately: our model applies deltas
+        // incrementally with no rollback (see above), so the honest
+        // stream reports every delta the OS measured, then says the
+        // gesture is over.
+        [self emitPinchChangeForEvent:event];
+        [self emitPinchInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_PINCH_END event:event magnification:0];
+        return;
+    }
+    // NSEventPhaseMayBegin / stationary phases carry no gesture fact.
+}
+
 - (void)keyDown:(NSEvent *)event {
     if ([self focusedTextAccessibilityElement]) {
         self.interpretedKeyEventEmittedInput = NO;
@@ -5708,6 +5785,59 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
                           button:0
                           deltaX:deltaX
                           deltaY:deltaY];
+}
+
+// --- Pinch change forwarding ---------------------------------------------
+// Raw event.magnification IS the wire's multiplicative per-event delta
+// (see the doctrine note at magnifyWithEvent:); it forwards untransformed.
+// One guard stands between the OS and the wire: a single event whose
+// magnification is at or below -1 would put a factor (1 + delta) <= 0 on
+// the wire — a zoom inverting through zero scale, which no physical pinch
+// can perform (only a driver/toolkit glitch could report it), and which
+// downstream products cannot recover from. Clamp PER EVENT to a floor
+// just above -1; the epsilon is 2^-10 (~0.001, exactly representable in
+// f32 and f64), so a glitched event's factor bottoms out at 2^-10 and
+// every emitted factor stays > 0.
+static const double NativeSdkPinchMagnificationFloor = -1.0 + 0x1p-10;
+
+static double NativeSdkClampedPinchMagnification(double magnification) {
+    return magnification < NativeSdkPinchMagnificationFloor ? NativeSdkPinchMagnificationFloor : magnification;
+}
+
+// Forward one magnify event's raw magnification as a PINCH_CHANGE
+// (nothing to emit when the event measured no magnification).
+- (void)emitPinchChangeForEvent:(NSEvent *)event {
+    const double magnification = NativeSdkClampedPinchMagnification(event.magnification);
+    if (magnification == 0) return;
+    [self emitPinchInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_PINCH_CHANGE event:event magnification:magnification];
+}
+
+// Pinch input: the shared input-emit shape (converted point, top-left
+// origin flip, host timestamp, modifier flags) with the magnification
+// delta riding the event's `scale` field — unused (zero) on every other
+// input kind, so the runtime reads it unconditionally. The x/y point is
+// the POINTER anchor: AppKit reports gesture events at locationInWindow
+// (the pointer location), never a midpoint between the fingers — NSTouch
+// positions are trackpad-normalized and have no view-space meaning, and
+// zoom-at-cursor is the anchoring apps want.
+- (void)emitPinchInputEventWithKind:(NSInteger)kind event:(NSEvent *)event magnification:(double)magnification {
+    if (!self.host || self.surfaceLabel.length == 0 || !event) return;
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    CGFloat y = self.bounds.size.height - point.y;
+    const char *labelBytes = self.surfaceLabel.UTF8String ?: "";
+    [self.host emitEvent:(native_sdk_appkit_event_t){
+        .kind = NATIVE_SDK_APPKIT_EVENT_GPU_SURFACE_INPUT,
+        .window_id = self.windowId,
+        .timestamp_ns = NativeSdkTimestampNanoseconds(),
+        .x = point.x,
+        .y = y,
+        .scale = magnification,
+        .view_label = labelBytes,
+        .view_label_len = [self.surfaceLabel lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+        .shortcut_modifiers = NativeSdkModifierFlagsForEvent(event),
+        .input_kind = (int)kind,
+    }];
+    [self requestRetainedCanvasFrame];
 }
 
 // --- Native scroll drivers ---------------------------------------------

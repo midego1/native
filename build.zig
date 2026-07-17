@@ -636,6 +636,43 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)requestRetainedCanvasFrame" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[self requestRetainedCanvasFrame];" },
     });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-pinch-terminal-delta", "Verify the macOS pinch stream forwards a terminal Ended/Cancelled magnification as a change before the end marker", &.{
+        // AppKit documents every magnifyWithEvent: as carrying the
+        // magnification since the previous event — the terminal one
+        // included. The Ended/Cancelled branch must forward a nonzero
+        // terminal magnification as PINCH_CHANGE before PINCH_END (zero
+        // magnification: end only), or the cumulative product of
+        // (1 + delta) diverges from what the OS delivered. Cancelled
+        // deliberately shares the path: pinch applies deltas
+        // incrementally with no rollback.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "[self emitPinchChangeForEvent:event];\n        [self emitPinchInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_PINCH_END event:event magnification:0];" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "PINCH_END event:event magnification:0];" },
+    });
+    addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-pinch-magnification-doctrine", "Verify the macOS host forwards raw NSEvent.magnification as the multiplicative pinch delta (the engine convention), with the per-event floor", &.{
+        // The reading of NSEvent.magnification is SETTLED and this step
+        // exists to keep it settled: Apple's API-reference prose says
+        // "add", Apple's own Event Handling Guide example multiplies,
+        // and every browser engine (WebKit, Chromium) treats raw
+        // magnification as the multiplicative per-event delta. The
+        // doctrine comment at magnifyWithEvent: carries the receipts;
+        // these pins hold both the comment and the code to it. Any
+        // sum-based "additive normalization" of magnification must
+        // change emitPinchChangeForEvent:'s pinned body — and thereby
+        // fail this step, on purpose. Re-read the doctrine comment
+        // before touching either.
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "m_magnification += m_magnification * scaleWithResistance;" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "pinch_update.scale = event.magnification + 1.0;" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "Ruling: raw event.magnification IS the multiplicative per-event" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "Do NOT reintroduce a running-sum" },
+        // The raw forwarding, pinned as one body: the only transform
+        // between the OS and the wire is the per-event floor (a single
+        // magnification at or below -1 would emit a factor <= 0 — a
+        // zoom inverted through zero scale, physically impossible).
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "static const double NativeSdkPinchMagnificationFloor = -1.0 + 0x1p-10;" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "return magnification < NativeSdkPinchMagnificationFloor ? NativeSdkPinchMagnificationFloor : magnification;" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "- (void)emitPinchChangeForEvent:(NSEvent *)event {\n    const double magnification = NativeSdkClampedPinchMagnification(event.magnification);\n    if (magnification == 0) return;\n    [self emitPinchInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_PINCH_CHANGE event:event magnification:magnification];\n}" },
+    });
     addFileContainsCheckStep(b, file_contains_checker, test_step, "test-appkit-gpu-input-paces-retained-canvas", "Verify GPU input frame requests are paced to the display interval", &.{
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkRetainedFrameIntervalNanoseconds" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "retainedFrameLastEmitNs" },

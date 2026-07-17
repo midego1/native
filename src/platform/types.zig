@@ -1550,6 +1550,16 @@ pub const GpuSurfaceInputKind = enum {
     ime_set_composition,
     ime_commit_composition,
     ime_cancel_composition,
+    // Trackpad gestures are phase-explicit (every source models phases:
+    // NSEvent.phase on macOS, GTK GestureZoom begin/scale-changed/end,
+    // Windows precision-touchpad gesture messages), and the family stays
+    // open for rotate/smart-zoom later. Only the macOS host emits these
+    // today; Windows (precision touchpad) and Linux (GTK GestureZoom)
+    // are staged follow-ups — on those platforms the kinds simply never
+    // arrive.
+    pinch_begin,
+    pinch_change,
+    pinch_end,
 };
 
 pub const GpuSurfaceInputEvent = struct {
@@ -1568,6 +1578,73 @@ pub const GpuSurfaceInputEvent = struct {
     text: []const u8 = "",
     composition_cursor: ?usize = null,
     modifiers: ShortcutModifiers = .{},
+    /// Pinch magnification DELTA for this event: nonzero only on
+    /// `pinch_change`, 0 on begin/end. The delta is MULTIPLICATIVE: the
+    /// cumulative gesture scale is the running product of `(1 + scale)`
+    /// across the gesture's change events. On macOS this is AppKit's
+    /// raw per-event `NSEvent.magnification`, forwarded untransformed —
+    /// raw magnification IS the multiplicative per-event delta, the
+    /// convention every browser engine ships (see the doctrine note at
+    /// `magnifyWithEvent:` in appkit_host.m), so the product matches
+    /// the zoom the same gesture performs in Safari and Chrome. The
+    /// host guarantees `1 + scale > 0` on every event (a per-event
+    /// floor clamps the physically impossible). The pointer anchor rides
+    /// `x`/`y` (view-local, same space as pointer events) — the pointer
+    /// location during the gesture, NOT a midpoint between the fingers:
+    /// hosts report gesture events at the pointer (AppKit's
+    /// `locationInWindow`), and zoom-at-cursor is the anchoring apps
+    /// want.
+    scale: f32 = 0,
+};
+
+/// Pinch gesture phase for the app-level pinch channel (`Options.on_pinch`
+/// / the TS core's `pinchMsg` export). Every source is phase-explicit
+/// (NSEvent phases, GTK GestureZoom, Windows precision-touchpad gestures);
+/// a host-cancelled gesture folds into `.end` — pinch delivers incremental
+/// deltas the app applies as they arrive, so there is no transient state
+/// to roll back the way `pointer_cancel` rolls back an in-flight press.
+/// A terminal host event (Ended or Cancelled) that still measured a
+/// nonzero magnification delivers that delta as a final `.change` before
+/// the `.end`, so the cumulative product always matches what the OS
+/// reported.
+pub const PinchPhase = enum {
+    begin,
+    change,
+    end,
+};
+
+/// The pinch channel's app-facing record, derived from the raw
+/// `gpu_surface_input` pinch events. Pinch bypasses the widget pipeline
+/// deliberately: it is a view-global gesture (timeline/canvas zoom), the
+/// `on_key`-fallback shape rather than a widget-targeted event.
+pub const PinchEvent = struct {
+    /// Source identity: which window and gpu-surface view the gesture
+    /// happened on (the `GpuFrame` identity shape, because `x`/`y` are
+    /// view-local — a coordinate without its view is not a position).
+    /// Multi-window and multi-view apps tell pinches apart by these.
+    /// `label` is borrowed for the callback, like every event slice:
+    /// a model that keeps it must copy.
+    window_id: WindowId = 1,
+    label: []const u8 = "",
+    phase: PinchPhase,
+    /// Magnification DELTA for this event: nonzero only on `.change`,
+    /// 0 on begin/end. The delta is MULTIPLICATIVE — the cumulative
+    /// gesture scale is the running product of `(1 + scale)` across the
+    /// gesture's change events; apply it memorylessly
+    /// (`zoom *= 1 + scale`), no gesture-start bookkeeping. On macOS
+    /// this is AppKit's raw per-event `NSEvent.magnification`, which IS
+    /// that multiplicative delta per the browser-engine convention, so
+    /// the product matches the zoom the same gesture performs in Safari
+    /// and Chrome. Every event keeps `1 + scale > 0`.
+    scale: f32 = 0,
+    /// The pointer anchor, view-local canvas points (the pointer-event
+    /// space): where the zoom should anchor. This is the POINTER
+    /// location during the gesture (AppKit reports gesture events at
+    /// `locationInWindow`), not a midpoint between the fingers — raw
+    /// touch positions are trackpad-normalized and never reach view
+    /// space, and zoom-at-cursor is what apps want anyway.
+    x: f32 = 0,
+    y: f32 = 0,
 };
 
 /// Upper bound on native scroll drivers per gpu-surface view (one per

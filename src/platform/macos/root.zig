@@ -906,6 +906,9 @@ fn gpuSurfaceInputEventFromAppKitEvent(event: *const AppKitEvent) platform_mod.G
         .text = event.input_text[0..event.input_text_len],
         .composition_cursor = if (event.has_composition_cursor != 0) event.composition_cursor else null,
         .modifiers = shortcutModifiersFromFlags(event.shortcut_modifiers),
+        // The pinch magnification delta rides the ABI event's `scale`
+        // field (zero on every non-pinch input emission).
+        .scale = @floatCast(event.scale),
     };
 }
 
@@ -1813,6 +1816,9 @@ fn gpuSurfaceInputKindFromInt(value: c_int) platform_mod.GpuSurfaceInputKind {
         9 => .ime_commit_composition,
         10 => .ime_cancel_composition,
         11 => .pointer_cancel,
+        12 => .pinch_begin,
+        13 => .pinch_change,
+        14 => .pinch_end,
         else => .pointer_move,
     };
 }
@@ -2240,6 +2246,34 @@ test "mac gpu surface input maps pointer cancel" {
 
     const input = gpuSurfaceInputEventFromAppKitEvent(&event);
     try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pointer_cancel, input.kind);
+}
+
+test "mac gpu surface input maps pinch phases and carries the magnification delta" {
+    const label = "timeline-canvas";
+    var event = std.mem.zeroes(AppKitEvent);
+    event.view_label = label.ptr;
+    event.view_label_len = label.len;
+    event.input_kind = 12;
+    try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pinch_begin, gpuSurfaceInputEventFromAppKitEvent(&event).kind);
+
+    // The magnification delta rides the ABI event's `scale` field with
+    // the pointer anchor on x/y (the host's converted, top-left-origin
+    // pointer location).
+    event.input_kind = 13;
+    event.x = 160;
+    event.y = 120;
+    event.scale = 0.25;
+    const change = gpuSurfaceInputEventFromAppKitEvent(&event);
+    try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pinch_change, change.kind);
+    try std.testing.expectEqual(@as(f32, 0.25), change.scale);
+    try std.testing.expectEqual(@as(f32, 160), change.x);
+    try std.testing.expectEqual(@as(f32, 120), change.y);
+
+    event.input_kind = 14;
+    event.scale = 0;
+    const end = gpuSurfaceInputEventFromAppKitEvent(&event);
+    try std.testing.expectEqual(platform_mod.GpuSurfaceInputKind.pinch_end, end.kind);
+    try std.testing.expectEqual(@as(f32, 0), end.scale);
 }
 
 test "mac appearance event maps color scheme" {

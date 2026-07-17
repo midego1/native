@@ -193,6 +193,12 @@ pub fn TsUiApp(comptime core: type) type {
                 }
                 stamped.on_key = keyMsgAdapter;
             }
+            if (comptime @hasDecl(core, "pinchMsg")) {
+                if (options.on_pinch != null) {
+                    @panic("TsUiApp wires on_pinch from the core's pinchMsg export - remove the wiring's on_pinch");
+                }
+                stamped.on_pinch = pinchMsgAdapter;
+            }
             if (comptime @hasDecl(core, "appearanceMsg")) {
                 if (options.on_appearance != null) {
                     @panic("TsUiApp wires on_appearance from the core's appearanceMsg export - remove the wiring's on_appearance");
@@ -358,6 +364,56 @@ pub fn TsUiApp(comptime core: type) type {
             arg.alt = keyboard.modifiers.alt;
             arg.super = keyboard.modifiers.super;
             return core.keyMsg(arg);
+        }
+
+        /// `Options.on_pinch` over the core's `pinchMsg(pinch)` export:
+        /// the emitted PinchEvent record — `windowId`/`label` (the
+        /// source identity: `x`/`y` are view-local, so a coordinate
+        /// without its view is not a position; multi-window cores tell
+        /// pinches apart by these), `phase` (the declared
+        /// begin/change/end alias, matched by member name), `scale` (the
+        /// magnification DELTA on "change" — multiplicative, so the
+        /// cumulative gesture scale is the product of `1 + scale`,
+        /// applied memorylessly), and the `x`/`y` pointer anchor
+        /// in view-local canvas points. The core's return gates the channel
+        /// exactly like a Zig `on_pinch` (null drops the event).
+        fn pinchMsgAdapter(pinch: platform.PinchEvent) ?Msg {
+            const params = @typeInfo(@TypeOf(core.pinchMsg)).@"fn".params;
+            if (comptime params.len != 1) {
+                @compileError("TsUiApp: pinchMsg must take one PinchEvent parameter - regenerate the core");
+            }
+            const PinchArg = params[0].type.?;
+            comptime {
+                const fields = @typeInfo(PinchArg).@"struct".fields;
+                if (fields.len != 6 or !@hasField(PinchArg, "windowId") or !@hasField(PinchArg, "label") or
+                    !@hasField(PinchArg, "phase") or !@hasField(PinchArg, "scale") or
+                    !@hasField(PinchArg, "x") or !@hasField(PinchArg, "y"))
+                {
+                    @compileError("TsUiApp: pinchMsg's PinchEvent must be exactly { windowId: number; label: string; phase: \"begin\" | \"change\" | \"end\"; scale: number; x: number; y: number }");
+                }
+                const Phase = @FieldType(PinchArg, "phase");
+                const phase_info = @typeInfo(Phase);
+                if (phase_info != .@"enum" or phase_info.@"enum".fields.len != 3 or
+                    !@hasField(Phase, "begin") or !@hasField(Phase, "change") or !@hasField(Phase, "end"))
+                {
+                    @compileError("TsUiApp: pinchMsg's PinchEvent.phase must be the named \"begin\" | \"change\" | \"end\" alias");
+                }
+            }
+            var arg: PinchArg = undefined;
+            const Phase = @FieldType(PinchArg, "phase");
+            arg.phase = switch (pinch.phase) {
+                inline else => |phase| @field(Phase, @tagName(phase)),
+            };
+            // The label slice stays borrowed exactly through the core
+            // call, like the Zig channel's contract: a Msg built from it
+            // commits (copies) on dispatch like every routed bytes
+            // payload.
+            arg.windowId = channelNum(@FieldType(PinchArg, "windowId"), @floatFromInt(pinch.window_id));
+            arg.label = pinch.label;
+            arg.scale = channelNum(@FieldType(PinchArg, "scale"), pinch.scale);
+            arg.x = channelNum(@FieldType(PinchArg, "x"), pinch.x);
+            arg.y = channelNum(@FieldType(PinchArg, "y"), pinch.y);
+            return core.pinchMsg(arg);
         }
 
         /// `Options.on_appearance` over the core's `appearanceMsg` arm
