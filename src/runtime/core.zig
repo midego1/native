@@ -329,6 +329,41 @@ pub const Runtime = struct {
     /// provenance table exists (builder-only apps, release engines).
     automation_provenance_published: bool = false,
     widget_event_route_entries: [canvas.max_widget_depth * 2]canvas.WidgetEventRouteEntry = undefined,
+    /// The in-flight IME preedit for the TARGETLESS text path (an app
+    /// consuming committed text with no focused text widget — a terminal
+    /// grid): updated by `ime_set_composition`, delivered as committed
+    /// text on `ime_commit_composition` (the host emits an EMPTY commit
+    /// when the marked text is committed unchanged, so the composed
+    /// bytes live only here), cleared on cancel or a direct text_input.
+    /// Grows to fit the current composition (never truncated): each
+    /// `ime_set_composition` REPLACES the preedit with the host's full
+    /// composition string, so this holds at most one composition's
+    /// bytes, reallocated up through `owned_allocator` only when a
+    /// larger one arrives and freed at `deinit`. `.len` is the allocated
+    /// capacity; `targetless_ime_preedit_len` is the bytes in use.
+    /// Focused text widgets never use this — their editor applies the
+    /// composition directly.
+    targetless_ime_preedit: []u8 = &.{},
+    targetless_ime_preedit_len: usize = 0,
+    /// The surface that buffered the preedit (window + view label) —
+    /// target-less composition state is PER SURFACE, the way a focused
+    /// widget's editor scopes its own composition to the widget. Only
+    /// events from the owning surface consume or clear the buffer: a
+    /// second surface's empty commit must never insert a composition the
+    /// user typed into the first (its own cancel/commit, delivered on its
+    /// own label, clears it). A new `ime_set_composition` from any
+    /// surface takes ownership — at most one system composition exists.
+    targetless_ime_preedit_window: platform.WindowId = 0,
+    targetless_ime_preedit_label: [platform.max_view_label_bytes]u8 = undefined,
+    targetless_ime_preedit_label_len: usize = 0,
+    /// The target-less twin of `RuntimeView.canvas_widget_ime_commit_grace`:
+    /// armed when the owning surface's composition CANCELS, because the
+    /// hosts encode a converted commit as cancel-then-text_input — the
+    /// trailing text_input still belongs to the target-less composition
+    /// and must deliver target-less (to the same surface, matched via
+    /// the preedit owner fields above) rather than into whichever text
+    /// widget holds focus by then. One-shot: any other event disarms it.
+    targetless_ime_commit_grace: bool = false,
     /// The in-flight native context-menu request: set when the
     /// platform is asked to present, resolved by the matching
     /// `context_menu_action` event. At most one menu tracks at a time.
@@ -502,6 +537,11 @@ pub const Runtime = struct {
     /// host) call it to return the storage.
     pub fn deinit(self: *Runtime) void {
         self.disarmMediaSurfaceWakes();
+        if (self.targetless_ime_preedit.len > 0) {
+            self.owned_allocator.free(self.targetless_ime_preedit);
+            self.targetless_ime_preedit = &.{};
+            self.targetless_ime_preedit_len = 0;
+        }
         for (self.canvas_font_entries[0..self.canvas_font_count]) |entry| {
             // Return the HOST side of the registration before the bytes:
             // registration pushed the face to platforms with host-side

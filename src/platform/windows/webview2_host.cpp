@@ -450,6 +450,14 @@ struct NativeView {
     double gpu_pointer_x = 0;
     double gpu_pointer_y = 0;
     WCHAR gpu_pending_high_surrogate = 0;
+    /* The WM_KEYDOWN just dispatched a registered shortcut, so every
+     * already-translated WM_CHAR trailing it belongs to the SAME
+     * keystroke and must not also type (AltGr raises Ctrl+Alt, so an
+     * AltGr chord that matches a ctrl+alt accelerator would otherwise
+     * both fire the accelerator and insert its composed text). Holds
+     * across the whole translated burst; the next WM_KEYDOWN or
+     * WM_KEYUP disarms it. */
+    bool gpu_shortcut_ate_char = false;
     /* UTF-8 preedit last sent as ime_set_composition; empty = no active
      * composition. Mirrors gpu_preedit_text in the GTK host and markedText
      * in the AppKit host. */
@@ -1273,6 +1281,24 @@ static std::string shortcutKeyFromWParam(WPARAM wparam) {
         case VK_RIGHT: return "arrowright";
         case VK_UP: return "arrowup";
         case VK_DOWN: return "arrowdown";
+        case VK_DELETE: return "delete";
+        case VK_HOME: return "home";
+        case VK_END: return "end";
+        case VK_PRIOR: return "pageup";
+        case VK_NEXT: return "pagedown";
+        case VK_INSERT: return "insert";
+        case VK_F1: return "f1";
+        case VK_F2: return "f2";
+        case VK_F3: return "f3";
+        case VK_F4: return "f4";
+        case VK_F5: return "f5";
+        case VK_F6: return "f6";
+        case VK_F7: return "f7";
+        case VK_F8: return "f8";
+        case VK_F9: return "f9";
+        case VK_F10: return "f10";
+        case VK_F11: return "f11";
+        case VK_F12: return "f12";
         case VK_OEM_PLUS: return "=";
         case VK_OEM_MINUS: return "-";
         case VK_OEM_COMMA: return ",";
@@ -1347,6 +1373,18 @@ static std::string shortcutKeyLabel(const std::string &key) {
     if (key == "arrowright") return "Right";
     if (key == "arrowup") return "Up";
     if (key == "arrowdown") return "Down";
+    if (key == "delete") return "Del";
+    if (key == "home") return "Home";
+    if (key == "end") return "End";
+    if (key == "pageup") return "PgUp";
+    if (key == "pagedown") return "PgDn";
+    if (key == "insert") return "Ins";
+    if (key.size() >= 2 && key.size() <= 3 && key[0] == 'f' &&
+        std::isdigit(static_cast<unsigned char>(key[1]))) {
+        std::string label = key;
+        label[0] = 'F';
+        return label;
+    }
     return key;
 }
 
@@ -1458,7 +1496,7 @@ static void showTrayMenu(Host *host, HWND hwnd) {
 }
 
 static bool emitShortcutForWindow(Host *host, const Window *window, WPARAM wparam) {
-    if (!host || host->shortcuts.empty()) return false;
+    if (!host || (host->shortcuts.empty() && host->menus.empty())) return false;
     if (!window) return false;
     std::string key = shortcutKeyFromWParam(wparam);
     if (key.empty()) return false;
@@ -1480,6 +1518,26 @@ static bool emitShortcutForWindow(Host *host, const Window *window, WPARAM wpara
             event.shortcut_modifiers = shortcut.modifiers;
             host->callback(host->callback_context, &event);
             return true;
+        }
+        /* Menu accelerators dispatch from the same keydown path: a menu
+         * item's key+modifiers is a keyboard binding whose event is the
+         * item's menu command, exactly as if the item were clicked. The
+         * other platforms get this from their menu systems (AppKit key
+         * equivalents, GTK accels); here the message loop is that system. */
+        for (const Menu &menu : host->menus) {
+            for (const MenuItem &item : menu.items) {
+                if (item.separator || !item.enabled || item.key.empty()) continue;
+                if (item.key != key) continue;
+                if (!shortcutModifiersMatch(item.modifiers, allow_implicit_shift)) continue;
+                if (!host->callback) return true;
+                WindowsEvent event = {};
+                event.kind = kMenuCommand;
+                event.window_id = window->id;
+                event.command_name = item.command.c_str();
+                event.command_name_len = item.command.size();
+                host->callback(host->callback_context, &event);
+                return true;
+            }
         }
     }
     return false;
@@ -2643,6 +2701,13 @@ static std::string gpuSurfaceKeyName(WPARAM wparam) {
 }
 
 static void gpuSurfaceCharInput(Host *host, NativeView &view, WPARAM wparam) {
+    /* A keystroke a registered shortcut consumed never ALSO types: the
+     * message loop translated its WM_CHAR(s) before the accelerator
+     * could refuse them. The latch holds for the WHOLE translated burst
+     * — one keystroke can post several UTF-16 units (ligature layouts,
+     * surrogate pairs) — and is bounded by the message sequence, not a
+     * count: the next WM_KEYDOWN or WM_KEYUP disarms it. */
+    if (view.gpu_shortcut_ate_char) return;
     const WCHAR unit = (WCHAR)wparam;
     std::wstring wide;
     if (unit >= 0xD800 && unit <= 0xDBFF) {
@@ -2660,8 +2725,15 @@ static void gpuSurfaceCharInput(Host *host, NativeView &view, WPARAM wparam) {
         wide.push_back(unit);
     }
     /* Control/alt chords produce control characters or menu accelerators,
-     * not text; mirror the GTK path, which skips text for modified keys. */
-    if (keyDown(VK_CONTROL) || keyDown(VK_MENU) || keyDown(VK_LWIN) || keyDown(VK_RWIN)) return;
+     * not text; mirror the GTK path, which skips text for modified keys.
+     * EXCEPT AltGr: Windows raises Ctrl+Alt together for it, and an
+     * AltGr-composed printable (AltGr+Q -> "@" on German layouts) IS
+     * committed text — the one chord whose WM_CHAR must flow, or those
+     * layouts lose the character entirely (an AltGr chord a shortcut
+     * consumed was already discarded above). Win alone still gates. */
+    const bool altgr = keyDown(VK_CONTROL) && keyDown(VK_MENU);
+    if (!altgr && (keyDown(VK_CONTROL) || keyDown(VK_MENU))) return;
+    if (keyDown(VK_LWIN) || keyDown(VK_RWIN)) return;
     const std::string text = narrow(wide);
     if (text.empty()) return;
     emitGpuSurfaceInput(host, view, kGpuInputTextInput, view.gpu_pointer_x, view.gpu_pointer_y, 0, 0, 0, "", text.c_str(), gpuModifierFlags());
@@ -2857,7 +2929,18 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
         }
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
-            if (emitShortcutForHwnd(host, GetAncestor(hwnd, GA_ROOT), wparam)) return 0;
+            /* A fresh keystroke re-disarms the one-shot: a shortcut that
+             * translated to no WM_CHAR (F-keys) must not leave it armed
+             * to eat a later ordinary character. */
+            view->gpu_shortcut_ate_char = false;
+            if (emitShortcutForHwnd(host, GetAncestor(hwnd, GA_ROOT), wparam)) {
+                /* The keystroke was consumed as a shortcut; its
+                 * already-translated WM_CHAR (posted by the message
+                 * loop's TranslateMessage before this dispatch) must
+                 * not ALSO type — one keystroke, one action. */
+                view->gpu_shortcut_ate_char = true;
+                return 0;
+            }
             const std::string key = gpuSurfaceKeyName(wparam);
             if (!key.empty()) {
                 emitGpuSurfaceInput(host, *view, kGpuInputKeyDown, view->gpu_pointer_x, view->gpu_pointer_y, 0, 0, 0, key.c_str(), "", gpuModifierFlags());
@@ -2866,6 +2949,9 @@ static LRESULT CALLBACK gpuSurfaceProc(HWND hwnd, UINT message, WPARAM wparam, L
         }
         case WM_KEYUP:
         case WM_SYSKEYUP: {
+            /* The shortcut keystroke's translated burst ended with its
+             * release: disarm the char latch (see gpuSurfaceCharInput). */
+            view->gpu_shortcut_ate_char = false;
             const std::string key = gpuSurfaceKeyName(wparam);
             if (!key.empty()) {
                 emitGpuSurfaceInput(host, *view, kGpuInputKeyUp, view->gpu_pointer_x, view->gpu_pointer_y, 0, 0, 0, key.c_str(), "", gpuModifierFlags());

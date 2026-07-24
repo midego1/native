@@ -402,6 +402,24 @@ pub fn isValidShortcutKey(key: []const u8) bool {
         "arrowright",
         "arrowup",
         "arrowdown",
+        "delete",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+        "insert",
+        "f1",
+        "f2",
+        "f3",
+        "f4",
+        "f5",
+        "f6",
+        "f7",
+        "f8",
+        "f9",
+        "f10",
+        "f11",
+        "f12",
     };
     for (&specials) |special| {
         if (std.ascii.eqlIgnoreCase(key, special)) return true;
@@ -1818,6 +1836,21 @@ pub const PinchEvent = struct {
     /// space, and zoom-at-cursor is what apps want anyway.
     x: f32 = 0,
     y: f32 = 0,
+};
+
+/// A wheel/trackpad scroll over a gpu surface, for the app-level wheel
+/// channel (`on_wheel` — the pinch channel's sibling). Deltas are the
+/// host's scroll units in view points, sign as the platform reports it
+/// (natural scrolling on hosts that apply it); `x`/`y` locate the
+/// pointer in view-local canvas points.
+pub const WheelEvent = struct {
+    window_id: WindowId = 1,
+    label: []const u8 = "",
+    delta_x: f32 = 0,
+    delta_y: f32 = 0,
+    x: f32 = 0,
+    y: f32 = 0,
+    modifiers: ShortcutModifiers = .{},
 };
 
 /// Upper bound on native scroll drivers per gpu-surface view (one per

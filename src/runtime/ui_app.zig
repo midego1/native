@@ -176,14 +176,25 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
 
         pub const ChromeOptions = struct {
             /// Number of chrome commands preserved in front of the
-            /// widget-generated commands.
+            /// widget-generated commands. With `variable_prefix`, the
+            /// BUDGET instead: `build` may emit any count up to it.
             prefix_commands: usize,
             /// Number of chrome commands preserved after the
-            /// widget-generated commands.
+            /// widget-generated commands. Always exact.
             suffix_commands: usize = 0,
+            /// The prefix length is whatever `build` emitted this
+            /// rebuild (minus the fixed suffix) rather than an exact
+            /// pin — for chrome whose command count is model-derived
+            /// (a terminal grid, a data plot). The runtime re-learns
+            /// the split at every install, so its internal widget-span
+            /// regenerations keep preserving the right commands; the
+            /// exact-count default stays the teaching check for
+            /// fixed-shape chrome, where a drifted count is a bug.
+            variable_prefix: bool = false,
             /// Builds the chrome display-list commands: exactly
             /// `prefix_commands` commands followed by `suffix_commands`
-            /// commands.
+            /// commands (up to `prefix_commands` under
+            /// `variable_prefix`).
             build: *const fn (model: *const ModelT, builder: *canvas.Builder, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void,
         };
 
@@ -537,6 +548,26 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// can never steal typing — a fallback that yields to every
             /// consuming widget can carry them safely.
             on_key: ?*const fn (keyboard: canvas.WidgetKeyboardEvent) ?MsgT = null,
+            /// Deliver `.key_up` phases through `on_key` too. OFF by
+            /// default: most key consumers act on presses alone, and a
+            /// release arriving unexpectedly would double-fire a
+            /// name-gated action. A terminal-class consumer opts in to
+            /// forward key releases to the child (the kitty keyboard
+            /// protocol's event reporting); consumers that opt in MUST
+            /// branch on `keyboard.phase`.
+            key_release_events: bool = false,
+            /// Optional mapping from unclaimed COMMITTED TEXT into
+            /// messages — `on_key`'s typing sibling for apps that
+            /// consume text themselves without a text-entry widget
+            /// focused (a terminal grid). Delivered for `.text_input`
+            /// phases only, after the same widget-precedence routing
+            /// `on_key` yields to: a focused editable widget keeps its
+            /// typing, and only unclaimed text falls through. The
+            /// event's `text` carries the committed UTF-8 (IME
+            /// composition results included), so consumers stay
+            /// layout- and input-method-correct — key names never
+            /// reconstruct text.
+            on_text: ?*const fn (keyboard: canvas.WidgetKeyboardEvent) ?MsgT = null,
             /// Optional mapping from trackpad pinch gestures into
             /// messages — the app-level gesture channel (the `on_key`
             /// shape). Pinch deliberately bypasses the widget pipeline:
@@ -557,6 +588,14 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             /// a pinch source emit these (macOS today); everywhere else
             /// the channel simply never fires.
             on_pinch: ?*const fn (pinch: platform.PinchEvent) ?MsgT = null,
+            /// Optional mapping from wheel/trackpad scrolls over a gpu
+            /// surface into messages — the pinch channel's sibling, for
+            /// apps whose content scrolls without a scroll-region
+            /// widget (a terminal's scrollback). Delivered for every
+            /// raw `.scroll` input on a focused gpu surface; apps that
+            /// also declare canvas scroll regions should leave this
+            /// null (regions consume wheel input themselves).
+            on_wheel: ?*const fn (wheel: platform.WheelEvent) ?MsgT = null,
             /// Optional mapping from runtime timer events (started via
             /// `runtime.startTimer`) into messages. Framework-reserved timer
             /// ids (>= `platform.reserved_timer_id_base`) are handled
@@ -1340,6 +1379,35 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                         record.dropped,
                         record.channel_dropped_total,
                     ),
+                    // `.pty` records deliver the RECORDED session:
+                    // output batches (resolved from the blob store
+                    // into `payload` by the replayer) feed the parked
+                    // spawn byte-identically — no shell ever runs —
+                    // and the exit retires it. Admission `.rejected`
+                    // records never reach here (they regenerate and
+                    // are skipped); executor-truth start failures feed
+                    // and retire the park at the spawn's dispatch
+                    // position.
+                    .pty => switch (record.pty_kind) {
+                        .output => try self.effects.feedPtyOutput(record.key, record.payload),
+                        .exit => try self.effects.feedPtyExit(
+                            record.key,
+                            record.code,
+                            record.pty_signal,
+                            record.exit_reason,
+                            record.pty_dropped_writes,
+                        ),
+                        // Write-admission verdicts are executor truth
+                        // (whether the FIFO had room depends on how fast
+                        // the child was reading): queue each — WITH the
+                        // pty key it was recorded against — for the
+                        // replayed dispatch's own `ptyWrite` calls, which
+                        // consume them in call order against the same
+                        // key (the clock feed's shape, keyed: the same
+                        // count and results against a different session
+                        // is still divergent input).
+                        .write => try self.effects.pushReplayPtyWriteVerdict(record.key, record.code == 1),
+                    },
                     // Spectrum records feed through the band-carrying
                     // helper so replay repaints identical bars; every
                     // other audio kind rides the plain shape.
@@ -1375,7 +1443,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     .video_load => self.effects.pushReplayVideoSource(record.key, record.video_token, record.video_source, record.video_kind == .failed),
                     .timer => {},
                 },
-                .finish => try self.effects.finishReplay(),
+                .finish => {
+                    try self.effects.finishReplay();
+                    try self.effects.settleReplayFeeds();
+                },
             }
         }
 
@@ -2768,15 +2839,22 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             var chrome_builder = canvas.Builder.init(&chrome_commands);
             try chrome.build(&self.model, &chrome_builder, self.canvas_size, tokens);
             const chrome_list = chrome_builder.displayList();
-            if (chrome_list.commands.len != chrome.prefix_commands + chrome.suffix_commands) {
+            if (chrome.variable_prefix) {
+                if (chrome_list.commands.len < chrome.suffix_commands or
+                    chrome_list.commands.len - chrome.suffix_commands > chrome.prefix_commands)
+                {
+                    return error.InvalidChromeCommandCount;
+                }
+            } else if (chrome_list.commands.len != chrome.prefix_commands + chrome.suffix_commands) {
                 return error.InvalidChromeCommandCount;
             }
+            const prefix_len = chrome_list.commands.len - chrome.suffix_commands;
 
             var commands: [canvas_limits.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
             var builder = canvas.Builder.init(&commands);
-            for (chrome_list.commands[0..chrome.prefix_commands]) |command| try builder.append(command);
+            for (chrome_list.commands[0..prefix_len]) |command| try builder.append(command);
             try layout.emitDisplayList(&builder, tokens);
-            for (chrome_list.commands[chrome.prefix_commands..]) |command| try builder.append(command);
+            for (chrome_list.commands[prefix_len..]) |command| try builder.append(command);
 
             _ = try runtime.setCanvasDisplayList(window_id, self.options.canvas_label, builder.displayList());
             // The main install window opens at the layout's true
@@ -2785,7 +2863,7 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
             // tree.
             try self.publishWidgetLayoutTracked(runtime, window_id, self.options.canvas_label, layout, &self.main_tree_current);
             _ = try runtime.emitCanvasWidgetDisplayListWithChrome(window_id, self.options.canvas_label, tokens, .{
-                .prefix_command_count = chrome.prefix_commands,
+                .prefix_command_count = prefix_len,
                 .suffix_command_count = chrome.suffix_commands,
             });
         }
@@ -3724,7 +3802,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 // Raw gpu-surface input stays runtime-internal EXCEPT the
                 // pinch kinds, which surface through the app-level pinch
                 // channel (widget routing never claims a pinch).
-                .gpu_surface_input => |input_event| try self.handlePinch(runtime, input_event),
+                .gpu_surface_input => |input_event| {
+                    try self.handlePinch(runtime, input_event);
+                    try self.handleWheel(runtime, input_event);
+                },
                 else => {},
             }
         }
@@ -5072,8 +5153,27 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                     }
                 }
             }
+            if (keyboard_event.keyboard.phase == .text_input) {
+                const text_map = self.options.on_text orelse return;
+                // COMMITTED text only. An IME preedit (`set_composition`)
+                // or a cancel is provisional and must never reach a
+                // consumer with no editor state (a terminal) — otherwise
+                // a composition-in-progress routed through a focused
+                // non-text widget would type bytes the user has not
+                // committed and cannot retract. `insert_text` is the
+                // committed insertion (a plain text_input, or the
+                // resolved commit the host delivers as text); every
+                // other edit kind is skipped here.
+                const edit = keyboard_event.keyboard.textEditEvent() orelse return;
+                if (edit != .insert_text) return;
+                if (text_map(keyboard_event.keyboard)) |msg| {
+                    try self.dispatch(runtime, keyboard_event.window_id, msg);
+                }
+                return;
+            }
             const map = self.options.on_key orelse return;
-            if (keyboard_event.keyboard.phase != .key_down) return;
+            const release = keyboard_event.keyboard.phase == .key_up and self.options.key_release_events;
+            if (keyboard_event.keyboard.phase != .key_down and !release) return;
             if (map(keyboard_event.keyboard)) |msg| {
                 try self.dispatch(runtime, keyboard_event.window_id, msg);
             }
@@ -5101,6 +5201,28 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
                 .scale = input_event.scale,
                 .x = input_event.x,
                 .y = input_event.y,
+            })) |msg| {
+                try self.dispatch(runtime, input_event.window_id, msg);
+            }
+        }
+
+        /// Wheel/trackpad scrolls reach the app as the pinch channel's
+        /// sibling (`Options.on_wheel`): the raw `.scroll` kind of the
+        /// gpu-surface input surface, for apps whose content scrolls
+        /// without a scroll-region widget (a terminal's scrollback).
+        /// The Msg dispatch rides the same journaled input event, so a
+        /// recorded scroll replays to the identical model.
+        fn handleWheel(self: *Self, runtime: *Runtime, input_event: platform.GpuSurfaceInputEvent) anyerror!void {
+            const map = self.options.on_wheel orelse return;
+            if (input_event.kind != .scroll) return;
+            if (map(.{
+                .window_id = input_event.window_id,
+                .label = input_event.label,
+                .delta_x = input_event.delta_x,
+                .delta_y = input_event.delta_y,
+                .x = input_event.x,
+                .y = input_event.y,
+                .modifiers = input_event.modifiers,
             })) |msg| {
                 try self.dispatch(runtime, input_event.window_id, msg);
             }

@@ -243,6 +243,26 @@ typedef struct native_sdk_gtk_native_view {
      * matching release is swallowed too (no orphaned pointer_up). */
     native_sdk_gtk_drag_region_t *drag_regions;
     size_t drag_region_count;
+    /* Keys whose composition-consumed key_down was suppressed (see
+     * native_sdk_gpu_key_pressed): the matching key_up is swallowed too,
+     * so the runtime never sees an orphan release — the drag-region
+     * claimed-press discipline, applied to composition keys. Tracked by
+     * PHYSICAL KEYCODE, never keyval: releasing Shift before the key
+     * changes the keyval between press and release (Shift+A records A,
+     * the release reads a) while the keycode names the same key both
+     * ways. Zero means an empty slot; bounded rollover, and an
+     * overflowed press falls back to emitting its release (activation
+     * paths ignore a release without its press, so the fallback is
+     * hygiene, not correctness). */
+    guint gpu_suppressed_keycodes[8];
+    /* A plain (no converted commit) composition cancel was just emitted
+     * and its resolving key's own key_down is being suppressed: the
+     * runtime's cancel-to-commit grace armed by that cancel expects the
+     * key_down as its disarm, so the suppression emits a synthetic
+     * duplicate cancel instead — a no-op everywhere except the grace
+     * probe it disarms. Cleared when a converted commit's text_input
+     * follows the cancel (the text itself consumes the grace). */
+    int gpu_cancel_disarm_pending;
     int gpu_drag_claimed_press;
 } native_sdk_gtk_native_view_t;
 
@@ -921,6 +941,9 @@ static void native_sdk_gpu_im_commit(GtkIMContext *context, const char *text, gp
         native_sdk_emit_gpu_surface_text_input(view, NATIVE_SDK_GTK_GPU_INPUT_IME_CANCEL_COMPOSITION, "", 0, 0);
     }
     native_sdk_emit_gpu_surface_text_input(view, NATIVE_SDK_GTK_GPU_INPUT_TEXT_INPUT, text, 0, 0);
+    /* The converted commit's trailing text_input consumes the runtime's
+     * cancel grace itself; no synthetic disarm is owed. */
+    view->gpu_cancel_disarm_pending = 0;
 }
 
 /* IM context preedit (composition) changed. Mirrors AppKit's setMarkedText:
@@ -939,6 +962,11 @@ static void native_sdk_gpu_im_preedit_changed(GtkIMContext *context, gpointer da
         if (native_sdk_gpu_surface_has_preedit(view)) {
             native_sdk_gpu_surface_clear_preedit(view);
             native_sdk_emit_gpu_surface_text_input(view, NATIVE_SDK_GTK_GPU_INPUT_IME_CANCEL_COMPOSITION, "", 0, 0);
+            /* A PLAIN cancel (no converted commit follows within this
+             * filter pass): the resolving key's suppressed key_down owes
+             * the runtime's cancel grace its disarm (see
+             * gpu_cancel_disarm_pending). */
+            view->gpu_cancel_disarm_pending = 1;
         }
         return;
     }
@@ -1429,17 +1457,61 @@ static gboolean native_sdk_gpu_key_event(native_sdk_gtk_native_view_t *view, gui
 }
 
 static gboolean native_sdk_gpu_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer data) {
-    (void)keycode;
     native_sdk_gtk_native_view_t *view = data;
     if (!view) return FALSE;
     GdkEvent *event = gtk_event_controller_get_current_event(GTK_EVENT_CONTROLLER(controller));
+    const int had_preedit = view->gpu_im_context && native_sdk_gpu_surface_has_preedit(view);
     if (view->gpu_im_context && event && gtk_im_context_filter_keypress(view->gpu_im_context, event)) {
-        /* The IM context consumed the key: committed text and preedit updates
-         * already flowed through the commit / preedit-changed handlers as
-         * text_input / ime_* events. Still surface a key_down with an empty
-         * text payload so activation keys (space, enter) and canvas key
-         * handlers keep firing; the runtime only inserts text from key_down
-         * events that carry text, so nothing is inserted twice. */
+        /* The IM context consumed the key. A key consumed WHILE a composition
+         * is active (before the filter ran, or opened by it) is composition
+         * machinery — candidate navigation, the confirming Enter, a
+         * cancelling Escape — and belongs wholly to the input method:
+         * surface nothing, or an app-level key consumer (a terminal) would
+         * double the confirm into its own key handling. This covers both
+         * synchronous IMs (the commit/cancel handlers ran inside the filter
+         * call, clearing the preedit had_preedit captured) and asynchronous
+         * ones (the preedit is still visible while the key is consumed). */
+        if (had_preedit || native_sdk_gpu_surface_has_preedit(view)) {
+            /* Remember the key — by PHYSICAL KEYCODE — so its release is
+             * swallowed too: a key_up without its key_down would be an
+             * orphan event, and the keyval would rename between press
+             * and release if Shift lifts first. DEDUPLICATED: autorepeat
+             * delivers many suppressed key_downs for one held key but
+             * only one final release, so a repeat must not stack entries
+             * a later ordinary release would then be eaten by. */
+            size_t free_slot = G_N_ELEMENTS(view->gpu_suppressed_keycodes);
+            gboolean recorded = FALSE;
+            for (size_t i = 0; i < G_N_ELEMENTS(view->gpu_suppressed_keycodes); i++) {
+                if (view->gpu_suppressed_keycodes[i] == keycode) {
+                    recorded = TRUE;
+                    break;
+                }
+                if (view->gpu_suppressed_keycodes[i] == 0 && free_slot == G_N_ELEMENTS(view->gpu_suppressed_keycodes)) {
+                    free_slot = i;
+                }
+            }
+            if (!recorded && free_slot < G_N_ELEMENTS(view->gpu_suppressed_keycodes)) {
+                view->gpu_suppressed_keycodes[free_slot] = keycode;
+            }
+            /* A plain cancel armed the runtime's cancel-to-commit grace
+             * expecting THIS key_down as its disarm: suppression owes it
+             * a synthetic duplicate cancel instead (a no-op everywhere
+             * but the grace probe), or the next ordinary text_input
+             * would be mistaken for a converted commit. */
+            if (view->gpu_cancel_disarm_pending) {
+                view->gpu_cancel_disarm_pending = 0;
+                native_sdk_emit_gpu_surface_text_input(view, NATIVE_SDK_GTK_GPU_INPUT_IME_CANCEL_COMPOSITION, "", 0, 0);
+            }
+            return TRUE;
+        }
+        /* Consumed with no composition anywhere in sight (the everyday
+         * GtkIMContextSimple commit of a plain printable): committed text
+         * and preedit updates already flowed through the commit /
+         * preedit-changed handlers as text_input / ime_* events. Still
+         * surface a key_down with an empty text payload so activation keys
+         * (space, enter) and canvas key handlers keep firing; the runtime
+         * only inserts text from key_down events that carry text, so nothing
+         * is inserted twice. */
         (void)native_sdk_gpu_key_event(view, keyval, state, NATIVE_SDK_GTK_GPU_INPUT_KEY_DOWN, 0);
         return TRUE;
     }
@@ -1447,11 +1519,19 @@ static gboolean native_sdk_gpu_key_pressed(GtkEventControllerKey *controller, gu
 }
 
 static void native_sdk_gpu_key_released(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer data) {
-    (void)keycode;
     native_sdk_gtk_native_view_t *view = data;
     if (!view) return;
     GdkEvent *event = gtk_event_controller_get_current_event(GTK_EVENT_CONTROLLER(controller));
     if (view->gpu_im_context && event) (void)gtk_im_context_filter_keypress(view->gpu_im_context, event);
+    /* A composition-consumed key whose key_down was suppressed swallows
+     * its release too (see gpu_suppressed_keycodes; matched by physical
+     * keycode so a modifier lifted mid-hold cannot rename the key). */
+    for (size_t i = 0; i < G_N_ELEMENTS(view->gpu_suppressed_keycodes); i++) {
+        if (view->gpu_suppressed_keycodes[i] == keycode) {
+            view->gpu_suppressed_keycodes[i] = 0;
+            return;
+        }
+    }
     (void)native_sdk_gpu_key_event(view, keyval, state, NATIVE_SDK_GTK_GPU_INPUT_KEY_UP, 0);
 }
 
@@ -1474,6 +1554,11 @@ static void native_sdk_gpu_focus_leave(GtkEventControllerFocus *controller, gpoi
     }
     gtk_im_context_reset(view->gpu_im_context);
     gtk_im_context_focus_out(view->gpu_im_context);
+    /* Pending suppressed releases die with the focus: their key_ups go
+     * to whichever surface focuses next (or nowhere), and a stale entry
+     * here would eat the same key's legitimate release after refocus. */
+    memset(view->gpu_suppressed_keycodes, 0, sizeof(view->gpu_suppressed_keycodes));
+    view->gpu_cancel_disarm_pending = 0;
 }
 
 static void native_sdk_setup_gpu_surface_view(native_sdk_gtk_native_view_t *view) {
@@ -2217,6 +2302,24 @@ static const char *native_sdk_accel_key_name(const char *key) {
     if (strcmp(key, "arrowright") == 0) return "Right";
     if (strcmp(key, "arrowup") == 0) return "Up";
     if (strcmp(key, "arrowdown") == 0) return "Down";
+    if (strcmp(key, "delete") == 0) return "Delete";
+    if (strcmp(key, "home") == 0) return "Home";
+    if (strcmp(key, "end") == 0) return "End";
+    if (strcmp(key, "pageup") == 0) return "Page_Up";
+    if (strcmp(key, "pagedown") == 0) return "Page_Down";
+    if (strcmp(key, "insert") == 0) return "Insert";
+    if (strcmp(key, "f1") == 0) return "F1";
+    if (strcmp(key, "f2") == 0) return "F2";
+    if (strcmp(key, "f3") == 0) return "F3";
+    if (strcmp(key, "f4") == 0) return "F4";
+    if (strcmp(key, "f5") == 0) return "F5";
+    if (strcmp(key, "f6") == 0) return "F6";
+    if (strcmp(key, "f7") == 0) return "F7";
+    if (strcmp(key, "f8") == 0) return "F8";
+    if (strcmp(key, "f9") == 0) return "F9";
+    if (strcmp(key, "f10") == 0) return "F10";
+    if (strcmp(key, "f11") == 0) return "F11";
+    if (strcmp(key, "f12") == 0) return "F12";
     return key;
 }
 
@@ -2462,6 +2565,30 @@ static const char *native_sdk_shortcut_key_for_keyval(guint keyval, char *buffer
         case GDK_KEY_Right: return "arrowright";
         case GDK_KEY_Up: return "arrowup";
         case GDK_KEY_Down: return "arrowdown";
+        case GDK_KEY_Delete:
+        case GDK_KEY_KP_Delete: return "delete";
+        case GDK_KEY_Home:
+        case GDK_KEY_KP_Home: return "home";
+        case GDK_KEY_End:
+        case GDK_KEY_KP_End: return "end";
+        case GDK_KEY_Page_Up:
+        case GDK_KEY_KP_Page_Up: return "pageup";
+        case GDK_KEY_Page_Down:
+        case GDK_KEY_KP_Page_Down: return "pagedown";
+        case GDK_KEY_Insert:
+        case GDK_KEY_KP_Insert: return "insert";
+        case GDK_KEY_F1: return "f1";
+        case GDK_KEY_F2: return "f2";
+        case GDK_KEY_F3: return "f3";
+        case GDK_KEY_F4: return "f4";
+        case GDK_KEY_F5: return "f5";
+        case GDK_KEY_F6: return "f6";
+        case GDK_KEY_F7: return "f7";
+        case GDK_KEY_F8: return "f8";
+        case GDK_KEY_F9: return "f9";
+        case GDK_KEY_F10: return "f10";
+        case GDK_KEY_F11: return "f11";
+        case GDK_KEY_F12: return "f12";
         default: return "";
     }
 }
@@ -3375,6 +3502,12 @@ void native_sdk_gtk_set_menus(native_sdk_gtk_host_t *host, const char *const *me
                 free(command);
                 free(key);
                 continue;
+            }
+            /* Canonicalize to lowercase, the shortcut-storage rule: key
+             * names validate case-insensitively, and the accelerator
+             * translation below matches the canonical spellings. */
+            for (char *p = key; *p; p++) {
+                if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
             }
 
             native_sdk_gtk_menu_action_t *menu_action = &host->menu_actions[host->menu_action_count];

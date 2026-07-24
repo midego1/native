@@ -68,6 +68,7 @@ const canvas = @import("canvas");
 const canvas_limits = @import("canvas_limits.zig");
 const platform = @import("../platform/root.zig");
 const runtime_clock = @import("clock.zig");
+const pty_transport = @import("pty.zig");
 
 /// Maximum in-flight effects (spawn slots / worker threads).
 pub const max_effects: usize = 16;
@@ -912,6 +913,97 @@ pub const max_effect_channel_bytes: usize = max_effect_line_bytes;
 /// stall of the posting thread).
 pub const max_effect_channel_pending: usize = 32;
 
+/// In-flight ptys (interactive terminal sessions) per Effects channel —
+/// their own table beside the channel table: a pty is a long-lived keyed
+/// occupancy like a channel, not a run-to-completion worker slot. One
+/// live terminal surface plus a background job or two is the realistic
+/// shape; a fifth spawn is refused loudly (reason `.rejected`).
+pub const max_effect_ptys: usize = 4;
+/// Longest one delivered pty output record: one Msg payload, one
+/// journal blob. Output arriving between drains coalesces into batches
+/// of at most this size — `cat largefile` journals per-drain batches,
+/// never per-read records.
+pub const max_effect_pty_chunk_bytes: usize = 64 * 1024;
+/// The cross-thread output staging ring per pty. When it fills, the io
+/// thread stops reading the parent end until the loop drains — kernel
+/// back-pressure to the child, a terminal's native flow control. Bytes
+/// are NEVER dropped: a fast producer is slowed, not lied to.
+pub const max_effect_pty_staging_bytes: usize = 256 * 1024;
+/// Largest one `ptyWrite` accepts: keystrokes and pastes, not bulk
+/// transfers (the spawn stdin bound, same teaching). Over-bound writes
+/// are refused whole and counted — a cut keystroke sequence would
+/// corrupt the child's input stream.
+pub const max_effect_pty_write_bytes: usize = 4096;
+/// Outbound (child stdin) staging between the loop thread and the io
+/// thread. A child that stops reading fills it; further writes are
+/// refused and counted into `EffectPtyEvent.dropped_writes` on the
+/// exit event — never silence.
+pub const max_effect_pty_outbound_bytes: usize = 64 * 1024;
+/// Distinct un-fully-sent `ptyWrite` payloads the outbound FIFO holds
+/// (see `PtyShared.out_write_lens`) — an admission bound alongside the
+/// byte budget, so every accepted write owns an exact length record and
+/// `dropped_writes` counts payloads precisely. A write past it is
+/// refused and counted, exactly like a full byte buffer; realistic
+/// input is a handful of small writes in flight, so only a child that
+/// stopped reading entirely reaches it.
+pub const max_effect_pty_write_records: usize = 256;
+/// Longest TERM value `ptySpawn` accepts.
+pub const max_effect_pty_term_bytes: usize = 32;
+/// Bytes of `ptyWrite` input a FAKE pty retains for test assertions
+/// (`ptyWrittenBytes`) — the scriptable pty's inspection window, not a
+/// delivery bound: writes beyond it drop oldest-first, exactly what a
+/// test inspecting "what did the app type" wants.
+pub const max_effect_pty_write_capture_bytes: usize = 4096;
+
+/// What one pty event Msg reports. `.output` carries a coalesced batch
+/// of child output bytes; `.exit` is the exactly-one terminal every
+/// accepted (and every refused) `ptySpawn` produces.
+pub const EffectPtyEventKind = enum(u8) {
+    output,
+    exit,
+    /// Journal-only: one `ptyWrite` admission verdict (accepted rides the
+    /// record's `code`, 1/0). The verdict is EXECUTOR TRUTH — whether the
+    /// outbound FIFO and record ring had room depends on how fast the
+    /// child was reading — so replay must feed the recorded verdicts
+    /// rather than recompute them against a fake with no child. Never
+    /// delivered as an event: no `EffectPtyEvent` ever carries this kind.
+    write,
+};
+
+/// Payload for `on_event` Msg constructors of pty effects. `bytes` is
+/// drain scratch, valid only during the `update` call that receives it
+/// — copy what the model keeps (feed it to the terminal emulator and
+/// move on). The exit taxonomy reuses the spawn vocabulary: `.exited`
+/// with the child's code, `.signaled` with the signal, `.cancelled`
+/// after `ptyKill`, `.rejected` for requests refused before a child
+/// existed, `.spawn_failed` when the pty or exec could not start.
+pub const EffectPtyEvent = struct {
+    key: u64,
+    kind: EffectPtyEventKind = .output,
+    bytes: []const u8 = "",
+    /// `.exit`: the child's exit code for a normal `.exited` end; -1 for
+    /// every non-`.exited` reason. One documented exception carries -1
+    /// WITH `.exited`: the child exited on its own but was reaped OUTSIDE
+    /// the toolkit before `waitpid` could read its status — only
+    /// reachable when an embedder installs `SA_NOCLDWAIT`, ignores
+    /// `SIGCHLD`, or runs its own reaper for the toolkit's children (the
+    /// toolkit forks the pty child and is its sole reaper, and never
+    /// touches SIGCHLD disposition). In that already-broken case the
+    /// real code is genuinely unrecoverable, so -1 is the honest
+    /// "unknown"; a session the toolkit actually reaps always carries
+    /// the real code.
+    code: i32 = effect_error_exit_code,
+    /// `.exit`: how the pty ended.
+    reason: EffectExitReason = .exited,
+    /// `.exit` after a fatal signal: the signal number, else 0.
+    signal: i32 = 0,
+    /// `.exit`: `ptyWrite` payloads refused over the pty's lifetime
+    /// (outbound staging full, or a single write over
+    /// `max_effect_pty_write_bytes`). Zero means every write reached
+    /// the child.
+    dropped_writes: u32 = 0,
+};
+
 /// What one channel event Msg reports. `.data` is one delivered post;
 /// `.closed` is the exactly-one terminal `closeChannel` produces (final
 /// drop totals aboard); `.rejected` is the exactly-one terminal a
@@ -1253,7 +1345,7 @@ pub const ChannelHandle = struct {
         // mutex (the lock-order invariant at `ChannelShared.mutex`) and
         // gated on the generation again under the wake half's own lock,
         // so a close racing this gap wakes nobody spuriously.
-        requestHostWake(shared, handle.generation);
+        requestHostWake(&shared.wake, handle.generation);
         return .accepted;
     }
 
@@ -1270,8 +1362,7 @@ pub const ChannelHandle = struct {
     /// the mutex after, so a teardown quiesce can still wait out every
     /// call into the host, and once the binding is revoked no new call
     /// can start.
-    fn requestHostWake(shared: *ChannelShared, generation: u64) void {
-        const wake = &shared.wake;
+    fn requestHostWake(wake: *ChannelWake, generation: u64) void {
         // Coalesce, LOCK-FREE: a latched flag means a host wake is in
         // flight whose drain pass clears the flag before snapshotting
         // the post order — the entry staged above is inside that
@@ -1361,8 +1452,7 @@ pub const ChannelHandle = struct {
 /// Called by every close path AFTER `open` cleared under the staging
 /// mutex; the two locks are taken strictly one after the other, never
 /// nested.
-fn revokeChannelWake(shared: *ChannelShared) void {
-    const wake = &shared.wake;
+fn revokeChannelWake(wake: *ChannelWake) void {
     wake.mutex.lock();
     wake.generation = 0;
     wake.services = null;
@@ -1408,9 +1498,8 @@ fn revokeChannelWake(shared: *ChannelShared) void {
 /// `MacPlatform.destroy` and its siblings). The caller still warns
 /// loudly naming the stuck hook — the leak is deliberate, never
 /// silent.
-fn quiesceChannelWake(shared: *ChannelShared, deadline_ms: u64) bool {
-    revokeChannelWake(shared);
-    const wake = &shared.wake;
+fn quiesceChannelWake(wake: *ChannelWake, deadline_ms: u64) bool {
+    revokeChannelWake(wake);
     const start_ns = runtime_clock.monotonicNanoseconds();
     while (wake.in_flight.load(.seq_cst) != 0) {
         const elapsed_ms = (runtime_clock.monotonicNanoseconds() - start_ns) / std.time.ns_per_ms;
@@ -1433,6 +1522,138 @@ pub const effect_timer_platform_id_base: u64 = platform.reserved_timer_id_base |
 /// `.fake` records spawn requests for tests to inspect and answer with
 /// `feedLine`/`feedExit` — fully deterministic, no processes, no threads.
 pub const EffectExecutor = enum { real, fake };
+
+/// One pty's cross-thread OUTPUT staging: a contiguous byte FIFO,
+/// deliberately unlike the channel staging's discrete posts — terminal
+/// output is one byte stream, and coalescing is the point (every byte
+/// arriving between drains delivers as one bounded batch). Allocated
+/// from process-lifetime storage per occupancy, freed when the exit
+/// terminal delivers (or at teardown), exactly the channel staging's
+/// lifetime.
+const PtyStaging = struct {
+    head: usize = 0,
+    len: usize = 0,
+    data: [max_effect_pty_staging_bytes]u8 = undefined,
+};
+
+/// The outbound (child stdin) buffers of one open pty: the byte ring the
+/// loop thread stages `ptyWrite` payloads into and the io thread drains,
+/// plus the per-payload length ring `dropped_writes` accounts from. Held
+/// in a SEPARATE heap block — allocated at the slot's spawn, freed at its
+/// retire — rather than inline in the process-lifetime `PtyShared`
+/// header, so the ~64 KiB never joins the permanent leak: only the small
+/// header does (the `ChannelShared` invariant). Freeing at retire is
+/// safe for the same reason the staging ring's free is: the io thread's
+/// exit is its last touch of this block (it drains outbound only inside
+/// its read loop, gated by `open`), and `ptyWrite` runs on the loop
+/// thread that owns retire — so at retire nothing reaches it. A teardown
+/// that ABANDONS a stuck io thread leaks this block with the thread,
+/// exactly as it leaks the staging ring.
+const PtyOutbound = struct {
+    data: [max_effect_pty_outbound_bytes]u8 = undefined,
+    write_lens: [max_effect_pty_write_records]u32 = @splat(0),
+};
+
+/// The owner-side counters a pty io thread may touch while the pty is
+/// open — the `ChannelOwnerRefs` shape: the shared post-order stamp and
+/// the pending mirror behind `hasPending`. Same validity argument: every
+/// close path clears `open` under `PtyShared.mutex` before the owner can
+/// be freed, and the io thread reads these only after observing `open`
+/// under that same mutex.
+const PtyOwnerRefs = struct {
+    seq: *std.atomic.Value(u64),
+    pending: *std.atomic.Value(usize),
+};
+
+/// The thread-shared half of one pty table slot: everything the pty io
+/// thread and the loop thread exchange. Allocated from
+/// `process_allocator` at the slot's first open and DELIBERATELY NEVER
+/// FREED — the abandoned-worker invariant, channel-shaped: teardown may
+/// abandon an io thread stuck past its join deadline, and everything
+/// that thread can still reach must stay allocated forever. The
+/// permanently-leaked part is just this small header, per pty slot per
+/// Effects instance; the two large per-session buffers (the staging ring
+/// and the outbound block, ~256 KiB and ~64 KiB) live in their own heap
+/// allocations freed at retire, so they never join the permanent leak —
+/// only a teardown that ABANDONS a stuck io thread leaks them, with the
+/// thread that can still reach them.
+///
+/// Lock discipline is `ChannelShared`'s, verbatim: `mutex` guards only
+/// bounded copies; the host wake lives in `wake` behind its OWN mutex,
+/// taken only after this one is released — the two never nest.
+const PtyShared = struct {
+    mutex: SpinMutex = .{},
+    /// Output and exits are accepted only while set. Cleared under the
+    /// mutex by every close path before anything the io thread could
+    /// reach is freed.
+    open: bool = false,
+    /// The occupancy this block currently serves (u64, monotonic —
+    /// the channel generation's width argument).
+    generation: u64 = 0,
+    staging: ?*PtyStaging = null,
+    /// Post-order stamp of the staged output backlog: assigned when the
+    /// ring transitions empty -> nonempty, held (with its pending count)
+    /// until the loop drains the ring EMPTY. Bytes appended to an
+    /// already-stamped backlog ride the batch — a byte stream has one
+    /// producer and inherent order, so per-byte stamps would buy
+    /// nothing but overhead.
+    data_seq: u64 = 0,
+    data_seq_valid: bool = false,
+    /// The io thread's staged exit — delivered only after the output
+    /// ring drains empty (data-before-exit, per pty, by construction).
+    exit_staged: bool = false,
+    exit_seq: u64 = 0,
+    exit_code: i32 = effect_error_exit_code,
+    exit_signal: i32 = 0,
+    exit_reason: EffectExitReason = .exited,
+    /// Set by the io thread when it stops reading because the staging
+    /// ring is full; the loop nudges the io thread's wake pipe after
+    /// draining so reading resumes (the back-pressure handshake).
+    reader_parked: bool = false,
+    /// Outbound (child stdin) FIFO, loop thread -> io thread. The byte
+    /// ring and per-payload length ring live in `outbound` (a heap block
+    /// freed at retire, so the ~64 KiB stays OUT of the permanent leak);
+    /// the cursors below index into it and stay inline in the header.
+    /// Valid (non-null) exactly while `open`. Refusals count into
+    /// `dropped_writes`, reported on the exit event.
+    outbound: ?*PtyOutbound = null,
+    out_head: usize = 0,
+    out_len: usize = 0,
+    /// Per-payload accounting for `dropped_writes`, so a discard counts
+    /// the writes NOT yet fully sent — never the ones already delivered.
+    /// `outbound.write_lens` is a ring of the byte length of each staged-
+    /// but-not-fully-sent `ptyWrite`; `out_front_sent` is how many bytes
+    /// of the head payload have already left. As bytes flush, fully-sent
+    /// payloads pop; on a discard, the surviving `out_write_count` is
+    /// what was truly lost. A pathological backlog past the record cap
+    /// merges into the tail entry (a bounded undercount, never a wrong
+    /// overcount of delivered writes).
+    out_write_head: usize = 0,
+    out_write_count: usize = 0,
+    out_front_sent: usize = 0,
+    dropped_writes: u32 = 0,
+    /// Set by the io thread under the mutex BEFORE it calls `waitpid`,
+    /// so a `ptyKill` or teardown that observes it never signals the
+    /// pid: `waitpid` may reap and free the pid for OS reuse the instant
+    /// after it returns, and setting the flag before the call means the
+    /// child is still alive (unwaited) for the whole window a signal
+    /// could be sent. This closes the pid-reuse race that a
+    /// post-`waitpid` `exit_staged` check alone leaves open.
+    reaping: bool = false,
+    /// `ptyKill` ran (the exit reports `.cancelled`, the spawn cancel
+    /// convention: after the verb, the exit always says so).
+    kill_requested: bool = false,
+    /// Teardown/kill asked the io thread to wind down.
+    shutdown: bool = false,
+    /// The io thread has returned (its last shared touch) — the
+    /// bounded-join flag teardown polls.
+    io_done: bool = false,
+    /// Valid only while `open` (see `PtyOwnerRefs`).
+    owner: ?PtyOwnerRefs = null,
+    /// The host-wake binding — the channel wake struct, reused whole:
+    /// same generation fence, same coalescer, same teardown quiesce.
+    wake: ChannelWake = .{},
+};
 
 /// Which effect channel a journaled result came from (the session
 /// record/replay taxonomy — one value per drain-delivered Msg shape,
@@ -1496,12 +1717,38 @@ pub const EffectResultKind = enum(u8) {
     /// never repack; the code value rides the journal, so a change
     /// here moves the format fingerprint.
     video_load = 14,
+    /// One pty event (`EffectPtyEvent`). Output records carry their
+    /// batch bytes in `payload` as they leave the drain, and the
+    /// session recorder moves them into the content-addressed blob
+    /// store (`pty_blob_hash`/`pty_blob_len`), the dynamic-image
+    /// pipeline — output is stream-shaped and dedup-friendly, the
+    /// opposite of the channel records' inline argument. Exit records
+    /// ride `code`/`exit_reason` plus the pty fields.
+    pty = 15,
 };
 
 /// Journaled wall-clock reads buffered for replay (`Effects.wallMs`).
 /// Bounded like everything else: more reads per drain window than this
 /// is a runaway loop, not a session shape.
 pub const max_effect_replay_clock_entries: usize = 64;
+/// Inline capacity of the replay `ptyWrite` verdict queue. One dispatch
+/// can legitimately issue ANY number of writes (a large paste drained in
+/// per-write-bound chunks, refused chunks retried within the same
+/// update), and every verdict for a dispatch feeds before the dispatch
+/// replays — so the queue must hold a whole dispatch's worth and spills
+/// to the heap past this inline window (the pending-stage growth story:
+/// a fixed bound would reject a valid recording).
+pub const max_effect_replay_pty_write_inline: usize = 64;
+
+/// One journaled `ptyWrite` admission verdict awaiting its replayed
+/// write: the pty KEY it was recorded against and the accepted bit.
+/// Keyed on purpose — a replayed run that wrote to a DIFFERENT pty with
+/// the same call count and results is still divergent input, and only
+/// the key comparison can see it.
+pub const ReplayPtyWriteVerdict = struct {
+    key: u64,
+    accepted: bool,
+};
 
 /// Inline capacity of the replayed video cascade-resolution queue
 /// (`Effects.pushReplayVideoSource`). Records precede the event whose
@@ -1610,6 +1857,18 @@ pub const EffectResultRecord = struct {
     /// replayed timeline could not dispatch (or would dispatch where
     /// none was) is divergence, not a silent consume.
     video_handled: bool = false,
+    /// `.pty` records: the delivered event kind. Output batches ride
+    /// `payload` out of the drain and the blob fields after the
+    /// recorder moves them out of line; exits ride `code` and
+    /// `exit_reason` plus the signal and refused-write count here.
+    pty_kind: EffectPtyEventKind = .output,
+    pty_signal: i32 = 0,
+    pty_dropped_writes: u32 = 0,
+    /// `.pty` output records: the content address of the journaled
+    /// batch bytes in the session blob store, filled by the recorder
+    /// when it moves `payload` out of line (the image convention).
+    pty_blob_hash: [effect_image_blob_hash_len]u8 = @splat(0),
+    pty_blob_len: u64 = 0,
 };
 
 /// Type-erased sink the drain reports every delivered result to while a
@@ -1653,6 +1912,283 @@ fn fallbackEnviron() std.process.Environ {
         return .{ .block = .{ .slice = envp[0..count :null] } };
     } else {
         return .empty;
+    }
+}
+
+/// Flatten the bound environ into the pty transport's env list — the
+/// spawn effect's inherit-the-host policy, made explicit because execve
+/// takes a flat envp. TERM is injected by the transport whether or not
+/// the host carried one. Returns null when the environ exceeds the
+/// transport's bounds: the child MUST see the whole environment the API
+/// promised, so an over-bound environ fails the spawn loudly rather
+/// than handing the child a silently truncated one (a required variable
+/// past the cutoff would otherwise vanish).
+fn flattenPtyEnviron(environ: std.process.Environ, buffer: []pty_transport.EnvVar) ?[]const pty_transport.EnvVar {
+    if (comptime std.process.Environ.Block != std.process.Environ.PosixBlock) return buffer[0..0];
+    var count: usize = 0;
+    var total_bytes: usize = 0;
+    for (environ.block.slice) |entry_opt| {
+        const entry = entry_opt orelse continue;
+        const text = std.mem.span(entry);
+        const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
+        // The transport injects its own TERM; a host TERM would race it.
+        if (std.mem.eql(u8, text[0..eq], "TERM")) continue;
+        if (count == buffer.len) return null;
+        if (total_bytes + text.len > pty_transport.max_env_bytes) return null;
+        buffer[count] = .{ .name = text[0..eq], .value = text[eq + 1 ..] };
+        count += 1;
+        total_bytes += text.len;
+    }
+    return buffer[0..count];
+}
+
+/// The pty io thread: one poll loop owning all blocking parent-end I/O.
+/// Reads coalesce into the shared staging ring (parking, not dropping,
+/// when it fills — the loop's drain nudges resumption); outbound bytes
+/// flush when the parent end accepts them; EOF reaps the child and stages
+/// the exit as the thread's last shared touch. Touches ONLY the
+/// process-lifetime shared block, the transport fds, and the nudge
+/// pipe's read end — never the slot — so a teardown that abandons this
+/// thread past its deadline leaks bounded fds, never memory safety.
+fn ptyIoLoop(shared: *PtyShared, transport: pty_transport.Pty, nudge_fd: c_int, generation: u64) void {
+    if (comptime !pty_transport.supported) return;
+    var local: [16 * 1024]u8 = undefined;
+    read_loop: while (true) {
+        shared.mutex.lock();
+        const shutdown = shared.shutdown;
+        const killed = shared.kill_requested;
+        // A REPLACED session — the slot retired past an abandon and a
+        // new spawn reused this permanent header with a fresh
+        // generation — silences this thread at once: the staging ring,
+        // parking flag, and every counter belong to the successor now,
+        // and `shutdown`/`kill_requested` were reset out from under a
+        // thread that missed its join deadline.
+        const superseded = shared.generation != generation;
+        const staged = if (shared.staging) |staging| staging.len else max_effect_pty_staging_bytes;
+        const room = max_effect_pty_staging_bytes - staged;
+        const want_read = room > 0;
+        if (!want_read and !superseded) shared.reader_parked = true;
+        const want_write = shared.out_len > 0;
+        shared.mutex.unlock();
+
+        // Teardown or a kill asked the thread to wind down: stop reading
+        // and go reap. Checked here so a reader PARKED on a full staging
+        // ring — which polls only the nudge pipe, never the parent end,
+        // so it can never observe a hangup — still exits promptly on the
+        // nudge. The kill case is load-bearing beyond teardown: the
+        // SIGKILL fells the direct child, but a new-session descendant
+        // that kept the child end open leaves the parent end with no EOF,
+        // so waiting for the pty to close would strand the exit forever.
+        // The direct child is dead, so `reapBlocking` below returns at
+        // once; the escaped descendant runs on detached, the spawn
+        // family's documented limit.
+        if (shutdown or killed or superseded) break :read_loop;
+
+        const ready = pty_transport.wait(transport.parent, nudge_fd, want_read, want_write);
+        if (ready.nudged) pty_transport.drainNudges(nudge_fd);
+        if (ready.writable) ptyFlushOutbound(shared, transport, generation);
+        if (ready.readable and want_read) {
+            const take = @min(local.len, room);
+            const n = transport.read(local[0..take]) catch |err| switch (err) {
+                // Nothing ready on the non-blocking parent end (a spurious
+                // readable): not EOF — re-poll.
+                error.WouldBlock => continue :read_loop,
+                // A real read error (or normalized EOF) ends the stream.
+                error.ReadFailed => break :read_loop,
+            };
+            if (n == 0) break :read_loop;
+            ptyStageOutput(shared, generation, local[0..n]);
+            continue :read_loop;
+        }
+        // Hangup with nothing readable is the EOF signal: the child
+        // side closed. (A parked reader ignores it until the drain
+        // frees room — the remaining bytes are still in the kernel
+        // buffer and readable.)
+        if (ready.hangup and want_read) break :read_loop;
+    }
+    // The stream is over: reap the child and stage the exit. Publish
+    // `reaping` BEFORE any waitpid so a racing ptyKill/teardown never
+    // signals a pid that reaping is about to free for reuse — until the
+    // reap returns the child is still alive, so declining to signal
+    // loses nothing. `reapEnding` never blocks forever: the normal case
+    // (child already exited) returns at once with no signal; a child
+    // that closed its terminal but kept running is hung up and escalated
+    // to SIGKILL within a bounded window; and a child the kernel holds
+    // in uninterruptible I/O past a further bounded window has its kill
+    // reported as the ending (the surrendered reap's documented zombie)
+    // — the exit always arrives. This is the thread's LAST shared touch
+    // before the wake.
+    shared.mutex.lock();
+    // Generation-gated like every terminal publish below: a superseded
+    // thread still reaps ITS OWN child (hygiene), but the successor's
+    // `reaping` flag steers the successor's ptyKill and must never be
+    // raised by a stale thread.
+    if (shared.generation == generation) shared.reaping = true;
+    shared.mutex.unlock();
+    const exit = transport.reapEnding();
+    // Every session end is also a cheap moment to settle earlier
+    // surrendered reaps whose children have since died — with the
+    // spawn-entry and teardown polls, a recovered child is reaped at
+    // the next pty activity of any kind.
+    pty_transport.reapSurrendered();
+    // A spawn whose exec probe timed out unresolved carries its status
+    // pipe here: the failure byte (written before the child's _exit) is
+    // readable exactly now, so a late exec failure still reports
+    // `spawn_failed` instead of masquerading as a normal end.
+    const late_exec_failure = transport.lateExecFailure();
+    shared.mutex.lock();
+    if (shared.open and shared.generation == generation) {
+        // Outbound bytes still staged at exit never reached the child:
+        // count each lost payload so `dropped_writes == 0` keeps its
+        // promise (distinct writes, not one lumped event).
+        if (shared.out_len > 0) {
+            shared.dropped_writes +|= @intCast(shared.out_write_count);
+            shared.out_len = 0;
+            shared.out_write_count = 0;
+            shared.out_front_sent = 0;
+        }
+        const cancelled = shared.kill_requested;
+        shared.exit_reason = if (cancelled)
+            .cancelled
+        else if (late_exec_failure)
+            .spawn_failed
+        else if (exit.signal != 0)
+            .signaled
+        else
+            .exited;
+        // `signal` is meaningful ONLY for `.signaled` (a fatal signal
+        // the child was not sent by cancel). A cancelled end reports
+        // signal 0 even though the toolkit's own SIGKILL is what felled
+        // it — the API contract is "signal != 0 iff reason == signaled".
+        shared.exit_signal = if (shared.exit_reason == .signaled) exit.signal else 0;
+        // Only a natural exit carries a meaningful child code; every
+        // other reason reports the doc's -1 sentinel.
+        shared.exit_code = if (shared.exit_reason == .exited) exit.code else effect_error_exit_code;
+        shared.exit_staged = true;
+        if (shared.owner) |owner| {
+            shared.exit_seq = owner.seq.fetchAdd(1, .seq_cst);
+            _ = owner.pending.fetchAdd(1, .seq_cst);
+        }
+    }
+    // `io_done` is the retirement-side COMPLETION PROOF (block frees
+    // hang on it), so a superseded thread must not publish it into a
+    // successor session that reset it for its own thread.
+    if (shared.generation == generation) shared.io_done = true;
+    shared.mutex.unlock();
+    ChannelHandle.requestHostWake(&shared.wake, generation);
+}
+
+/// Append read bytes into the staging ring (bounded by the room the
+/// caller observed) and stamp/wake exactly like a channel post: the
+/// first batch after an empty ring stamps the backlog and requests one
+/// coalesced host wake.
+fn ptyStageOutput(shared: *PtyShared, generation: u64, bytes: []const u8) void {
+    var stamped = false;
+    shared.mutex.lock();
+    if (shared.open and shared.generation == generation) {
+        if (shared.staging) |staging| {
+            const room = max_effect_pty_staging_bytes - staging.len;
+            const take = @min(room, bytes.len);
+            var index: usize = 0;
+            while (index < take) : (index += 1) {
+                staging.data[(staging.head + staging.len + index) % max_effect_pty_staging_bytes] = bytes[index];
+            }
+            staging.len += take;
+            if (take > 0 and !shared.data_seq_valid) {
+                if (shared.owner) |owner| {
+                    shared.data_seq = owner.seq.fetchAdd(1, .seq_cst);
+                    shared.data_seq_valid = true;
+                    _ = owner.pending.fetchAdd(1, .seq_cst);
+                    stamped = true;
+                }
+            } else if (take > 0) {
+                stamped = true;
+            }
+        }
+    }
+    shared.mutex.unlock();
+    if (stamped) ChannelHandle.requestHostWake(&shared.wake, generation);
+}
+
+/// Flush staged outbound bytes toward the child while the parent end
+/// accepts them. Bounded copies under the mutex, the write itself
+/// outside it.
+fn ptyFlushOutbound(shared: *PtyShared, transport: pty_transport.Pty, generation: u64) void {
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        shared.mutex.lock();
+        if (!shared.open or shared.generation != generation or shared.out_len == 0) {
+            shared.mutex.unlock();
+            return;
+        }
+        const take = @min(chunk.len, shared.out_len);
+        const outbound = shared.outbound.?;
+        var index: usize = 0;
+        while (index < take) : (index += 1) {
+            chunk[index] = outbound.data[(shared.out_head + index) % max_effect_pty_outbound_bytes];
+        }
+        shared.mutex.unlock();
+        const wrote = transport.write(chunk[0..take]) catch |err| switch (err) {
+            // The child's input buffer is full (it is not reading): the
+            // bytes STAY staged and retry on the next writable poll.
+            // Returning here — rather than looping — is what keeps a
+            // non-reading child from blocking the io thread and
+            // stalling stdout: one bounded write attempt per POLLOUT.
+            error.WouldBlock => return,
+            // A real write error (the child closed its read end): the
+            // staged bytes can never reach it. Drop and count each lost
+            // payload so `dropped_writes == 0` keeps meaning "every
+            // write landed".
+            error.WriteFailed => {
+                shared.mutex.lock();
+                // Same re-check as the accounting below: a session
+                // revoked (or replaced) during the write owns these
+                // counters now — a stale thread must not fold drops
+                // into a successor's tallies.
+                if (shared.open and shared.generation == generation and shared.out_len > 0) {
+                    shared.dropped_writes +|= @intCast(shared.out_write_count);
+                    shared.out_len = 0;
+                    shared.out_write_count = 0;
+                    shared.out_front_sent = 0;
+                }
+                shared.mutex.unlock();
+                return;
+            },
+        };
+        if (wrote == 0) return;
+        shared.mutex.lock();
+        // RE-CHECK the gates after the unlocked write: the loop thread
+        // may have revoked this session while the write ran (an abandon
+        // past the join deadline retires the slot and nulls — possibly
+        // frees — the outbound block). A revoked session's accounting
+        // is dead state; touching the block would be a null unwrap or a
+        // use-after-free. Every heap-block deref on this thread sits
+        // under the mutex WITH its gate — this was the one that did not.
+        if (!shared.open or shared.generation != generation) {
+            shared.mutex.unlock();
+            return;
+        }
+        shared.out_head = (shared.out_head + wrote) % max_effect_pty_outbound_bytes;
+        shared.out_len -= @min(wrote, shared.out_len);
+        // Pop every payload these bytes fully sent, so a later discard
+        // counts only the writes that never reached the child.
+        var sent = wrote;
+        const write_lens = &shared.outbound.?.write_lens;
+        while (sent > 0 and shared.out_write_count > 0) {
+            const front = write_lens[shared.out_write_head] - shared.out_front_sent;
+            if (sent >= front) {
+                sent -= front;
+                shared.out_front_sent = 0;
+                shared.out_write_head = (shared.out_write_head + 1) % max_effect_pty_write_records;
+                shared.out_write_count -= 1;
+            } else {
+                shared.out_front_sent += sent;
+                sent = 0;
+            }
+        }
+        const drained = shared.out_len == 0;
+        shared.mutex.unlock();
+        if (drained or wrote < take) return;
     }
 }
 
@@ -1841,6 +2377,7 @@ pub fn Effects(comptime Msg: type) type {
         pub const HostMsgFn = *const fn (result: EffectHostResult) Msg;
         pub const ImageMsgFn = *const fn (result: EffectImageResult) Msg;
         pub const ChannelMsgFn = *const fn (event: EffectChannelEvent) Msg;
+        pub const PtyMsgFn = *const fn (event: EffectPtyEvent) Msg;
 
         /// Comptime Msg constructor for `on_line`, following
         /// `canvas.Ui(Msg).inputMsg`: `lineMsg(.agent_line)` builds
@@ -1968,6 +2505,17 @@ pub fn Effects(comptime Msg: type) type {
         pub fn channelMsg(comptime tag: std.meta.Tag(Msg)) ChannelMsgFn {
             return struct {
                 fn make(event: EffectChannelEvent) Msg {
+                    return @unionInit(Msg, @tagName(tag), event);
+                }
+            }.make;
+        }
+
+        /// Comptime Msg constructor for `on_event` of pty effects:
+        /// `ptyMsg(.shell)` builds `Msg{ .shell = event }` — the
+        /// variant's payload type must be `native_sdk.EffectPtyEvent`.
+        pub fn ptyMsg(comptime tag: std.meta.Tag(Msg)) PtyMsgFn {
+            return struct {
+                fn make(event: EffectPtyEvent) Msg {
                     return @unionInit(Msg, @tagName(tag), event);
                 }
             }.make;
@@ -2309,6 +2857,106 @@ pub fn Effects(comptime Msg: type) type {
             max_pending: u32 = max_effect_channel_pending,
         };
 
+        pub const PtySpawnOptions = struct {
+            /// Caller-chosen identity, stored in the model. Shares the
+            /// keyed families' one key space, occupied from spawn until
+            /// the `.exit` terminal delivers.
+            key: u64,
+            /// The command and its arguments (shares the spawn effect's
+            /// argv budgets). argv[0] resolves against the child
+            /// environment's PATH.
+            argv: []const []const u8,
+            /// Initial grid size the child observes via TIOCGWINSZ.
+            cols: u16 = 80,
+            rows: u16 = 24,
+            /// The TERM the child starts with. The rest of the child's
+            /// environment is the spawn policy verbatim: the bound host
+            /// environ (`bindEnviron`), nothing else — a pty is a spawn
+            /// with a different transport, one env story.
+            term: []const u8 = pty_transport.default_term,
+            /// Every pty event — each coalesced output batch and the
+            /// exactly-one `.exit` terminal — arrives through this
+            /// constructor. Required: a terminal nobody watches is not
+            /// a terminal.
+            on_event: PtyMsgFn,
+        };
+
+        /// A recorded fake-pty spawn request, exposed for test
+        /// assertions (`pendingPtyAt`). Strings borrow the slot's
+        /// storage — valid until the slot retires.
+        pub const PtyRequest = struct {
+            key: u64,
+            argv: []const []const u8,
+            cols: u16,
+            rows: u16,
+            term: []const u8,
+        };
+
+        /// How one pty table slot advances: `.running` from the
+        /// accepted spawn until its `.exit` terminal DELIVERS — the
+        /// exit retires the slot to `.idle` before the Msg reaches
+        /// update, the families' shared instant. There is no `.closing`
+        /// phase: the io thread stages the exit into the shared block
+        /// and the drain's delivery is the retire.
+        const PtySlotState = enum(u8) { idle, running };
+
+        const PtySlot = struct {
+            state: PtySlotState = .idle,
+            key: u64 = 0,
+            /// u64 from the channel-owned monotonic counter (shared
+            /// with channel occupancies; same width argument).
+            generation: u64 = 0,
+            on_event: ?PtyMsgFn = null,
+            fake: bool = false,
+            /// The slot's process-lifetime shared block — created at
+            /// the slot's first REAL open, reused across occupancies,
+            /// never freed (see `PtyShared`). Fake and parked
+            /// occupancies never touch it.
+            shared: ?*PtyShared = null,
+            /// The live transport (real executor on a posix target).
+            transport: if (pty_transport.supported) ?pty_transport.Pty else void =
+                if (pty_transport.supported) null else {},
+            io_thread: ?WorkerThread = null,
+            /// The io thread's nudge pipe: [read, write]. Written by
+            /// the loop (outbound bytes staged, drain freed staging
+            /// room, shutdown); poll()'d by the io thread.
+            wake_pipe: [2]c_int = .{ -1, -1 },
+            /// Grid mirrors (the automation/test truth of the last
+            /// accepted spawn/resize).
+            cols: u16 = 0,
+            rows: u16 = 0,
+            /// Fake mirror of `ptyKill` for test assertions.
+            kill_requested: bool = false,
+            /// Fake capture of `ptyWrite` payloads (`ptyWrittenBytes`),
+            /// oldest dropped past the window.
+            write_capture: [max_effect_pty_write_capture_bytes]u8 = undefined,
+            write_capture_len: usize = 0,
+            /// Fake mirror of refused writes (over-bound payloads).
+            dropped_writes: u32 = 0,
+            /// Request storage for the fake/test seam.
+            argv_storage: [max_effect_argv_bytes]u8 = undefined,
+            argv_slices: [max_effect_argv][]const u8 = undefined,
+            argv_count: usize = 0,
+            term_storage: [max_effect_pty_term_bytes]u8 = undefined,
+            term_len: usize = 0,
+            /// Session replay only: the pending-order reservation this
+            /// parked spawn holds (see `ParkOrderState` — the channel
+            /// park dance, pty-shaped: a fed start-failure terminal
+            /// reclaims the stamp and delivers through the pending
+            /// stage at the spawn's dispatch position; a fed output or
+            /// real exit proves the spawn started live and vacates it).
+            park_seq: u64 = 0,
+            park_state: ParkOrderState = .none,
+
+            fn requestArgv(slot: *const PtySlot) []const []const u8 {
+                return slot.argv_slices[0..slot.argv_count];
+            }
+
+            fn requestTerm(slot: *const PtySlot) []const u8 {
+                return slot.term_storage[0..slot.term_len];
+            }
+        };
+
         /// How one channel table slot advances: `.open` accepts posts
         /// and delivers `.data` events; `.closing` (closeChannel ran)
         /// flushes the staged backlog, delivers the one `.closed`
@@ -2635,7 +3283,7 @@ pub fn Effects(comptime Msg: type) type {
 
         const SlotKind = enum(u8) { spawn, fetch, file, clipboard, host, image };
 
-        const EntryKind = enum(u8) { line, exit, response, file, clipboard, host, image, channel };
+        const EntryKind = enum(u8) { line, exit, response, file, clipboard, host, image, channel, pty };
 
         const Entry = struct {
             kind: EntryKind = .line,
@@ -2705,6 +3353,16 @@ pub fn Effects(comptime Msg: type) type {
             /// construction), `dropped_before` carries dropped_pending
             /// and `dropped_lines` the cumulative total.
             channel_kind: EffectChannelEventKind = .data,
+            /// `.pty` entries (session replay's fed pty events; live
+            /// events ride the per-pty staging instead): the recorded
+            /// event kind. `slot_index` names a PTY table slot and
+            /// `channel_generation` its u64 occupancy generation;
+            /// output bytes ride `line_bytes` up to the inline bound
+            /// and `heap_line` past it; exits ride `code`/`reason`
+            /// plus the fields here.
+            pty_kind: EffectPtyEventKind = .output,
+            pty_signal: i32 = 0,
+            pty_dropped_writes: u32 = 0,
             line_fn: ?LineMsgFn = null,
             exit_fn: ?ExitMsgFn = null,
             response_fn: ?ResponseMsgFn = null,
@@ -2726,6 +3384,13 @@ pub fn Effects(comptime Msg: type) type {
         /// cancel (`.response`). Response bodies are always empty here.
         const PendingMsg = union(enum) {
             exit: struct { exit: EffectExit, exit_fn: ?ExitMsgFn },
+            pty: struct {
+                event: EffectPtyEvent,
+                pty_fn: ?PtyMsgFn,
+                regenerates: bool,
+                retire_slot: ?usize = null,
+                retire_generation: u64 = 0,
+            },
             response: struct { response: EffectResponse, response_fn: ?ResponseMsgFn },
             file: struct { result: EffectFileResult, file_fn: ?FileMsgFn },
             clipboard: struct { result: EffectClipboardResult, clipboard_fn: ?ClipboardMsgFn },
@@ -2814,6 +3479,10 @@ pub fn Effects(comptime Msg: type) type {
                     // eviction here would silently break the
                     // exactly-one-terminal-per-load contract.
                     .image => unreachable,
+                    // Pty terminals stage in the non-lossy
+                    // `pending_ptys` for the same reason — exactly
+                    // one `.exit` per spawn.
+                    .pty => unreachable,
                     // Channel terminals stage in the non-lossy
                     // `pending_channels` for the same reason —
                     // exactly one `.rejected` per refused open.
@@ -2833,6 +3502,7 @@ pub fn Effects(comptime Msg: type) type {
                     .clipboard => |entry| entry.result.dropped_before,
                     .timer => 0,
                     .audio => 0,
+                    .pty => 0,
                     .host => 0,
                     // Never in the ring; see `addDropped`.
                     .video => unreachable,
@@ -2959,6 +3629,22 @@ pub fn Effects(comptime Msg: type) type {
             retire_slot: ?usize = null,
             /// Generation gate for `retire_slot`, the fed-terminal
             /// discipline.
+            retire_generation: u64 = 0,
+        };
+
+        /// One loop-side pty `.exit` terminal awaiting drain — the pty
+        /// twin of `PendingChannel`, non-lossy for the same contract
+        /// (exactly one terminal per refused spawn). Shares the
+        /// `pending_seq` stamp so the drain merges every loop-side
+        /// stage in enqueue order; fed park-retiring start failures
+        /// carry their park's older stamp and insert in seq order,
+        /// the channel discipline verbatim.
+        const PendingPty = struct {
+            seq: u64,
+            event: EffectPtyEvent,
+            pty_fn: ?PtyMsgFn,
+            regenerates: bool,
+            retire_slot: ?usize = null,
             retire_generation: u64 = 0,
         };
 
@@ -3274,6 +3960,12 @@ pub fn Effects(comptime Msg: type) type {
 
         allocator: std.mem.Allocator,
         executor: EffectExecutor = .real,
+        /// Test seam for the FAKE pty only: while set, fake `ptyWrite`
+        /// admissions refuse (and count) exactly as the live path does
+        /// against a full outbound FIFO — the scriptable stand-in for a
+        /// child that stopped reading, so retention/back-pressure logic
+        /// tests both phases (refusing, then draining) honestly.
+        fake_pty_write_full: bool = false,
         /// Fake-executor convention: while set, every `loadImage` that
         /// parks a fake request completes IMMEDIATELY with these bytes
         /// (through `feedImageBytes`, the full decode→register path) —
@@ -3290,15 +3982,17 @@ pub fn Effects(comptime Msg: type) type {
         /// the staging FIFO, and the services snapshot at
         /// `wake_snapshot`). Defaults to `process_allocator`, and
         /// any replacement MUST delegate every allocation it does not
-        /// refuse to `process_allocator`'s backing: retire and teardown
-        /// free the header/FIFO storage through `process_allocator`
-        /// directly (the snapshot is created AND destroyed through this
-        /// seam, which is what lets the snapshot lifetime tests count
-        /// it). Swap seam for the channel start-failure and
-        /// snapshot-lifetime tests — `loadImage` stages its source
-        /// buffer from the app allocator, so its failure tests inject
-        /// there; channel storage is process-lifetime and needs this
-        /// explicit seam.
+        /// refuse to `process_allocator`'s backing: CHANNEL retire and
+        /// teardown free the header/FIFO storage through
+        /// `process_allocator` directly (the snapshot is created AND
+        /// destroyed through this seam, which is what lets the snapshot
+        /// lifetime tests count it). Pty session buffers (staging ring,
+        /// outbound block) allocate AND free through this seam, so a
+        /// tracking or arena replacement sees its own frees. Swap seam
+        /// for the channel start-failure and snapshot-lifetime tests —
+        /// `loadImage` stages its source buffer from the app allocator,
+        /// so its failure tests inject there; channel storage is
+        /// process-lifetime and needs this explicit seam.
         channel_storage_allocator: std.mem.Allocator = process_allocator,
         /// Session-record sink: every drain-delivered result is reported
         /// here (loop thread, right before its Msg runs through
@@ -3325,6 +4019,27 @@ pub fn Effects(comptime Msg: type) type {
         /// divergence signal (the replayed update read the clock more
         /// often than the recorded one). Reported loudly once.
         replay_clock_underflows: u64 = 0,
+        /// Journaled `ptyWrite` admission verdicts queued for replay-mode
+        /// writes (keyed FIFO; fed from `.pty`/`.write` records before
+        /// the consuming event dispatches — the `replay_clock` shape,
+        /// with the pending-stage inline+spill growth so a dispatch that
+        /// wrote any number of times replays whole). The verdict is
+        /// executor truth: live it depends on how fast the child drained
+        /// the outbound FIFO, so a replayed write must take the RECORDED
+        /// path — retaining or removing the app's pending bytes exactly
+        /// as the live run did — never an optimistic recomputation
+        /// against a fake with no child.
+        replay_pty_write_verdicts: [max_effect_replay_pty_write_inline]ReplayPtyWriteVerdict = undefined,
+        replay_pty_write_spill: []ReplayPtyWriteVerdict = &.{},
+        replay_pty_write_head: usize = 0,
+        replay_pty_write_len: usize = 0,
+        /// Replay writes that diverged from the journaled verdict stream:
+        /// a write past the recorded count, or a write against a
+        /// DIFFERENT pty key than the verdict at the queue's head (same
+        /// count and results against another session is still divergent
+        /// input). Reported loudly once; the end-of-journal settle turns
+        /// any nonzero count into a replay failure.
+        replay_pty_write_divergences: u64 = 0,
         /// Journaled launch-env deliveries queued for the replay-mode
         /// envMsgs dispatch (FIFO; fed from `.env` records before the
         /// installing event dispatches). Empty under replay means the
@@ -3533,6 +4248,28 @@ pub fn Effects(comptime Msg: type) type {
         /// slice stays valid while `update` runs (recycled per
         /// delivered channel Msg, the `drain_scratch` discipline).
         channel_drain_scratch: [max_effect_channel_bytes]u8 = undefined,
+        /// Fixed pty table (see `max_effect_ptys`): long-lived keyed
+        /// occupancies beside the channel table. Loop-thread only —
+        /// the thread-shared half of each slot lives behind its
+        /// `PtySlot.shared` header.
+        pty_slots: [max_effect_ptys]PtySlot = [_]PtySlot{.{}} ** max_effect_ptys,
+        /// Monotonic stamp shared by every pty's staged output backlog
+        /// and exit marker — the channels' `channel_seq`, pty-shaped:
+        /// cross-pty delivery order and the drain boundary's causality
+        /// cut.
+        pty_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Undelivered pty completions (stamped output backlogs + staged
+        /// exits), mirrored atomically for `hasPending`.
+        pty_pending_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        /// Pty staging/outbound block pairs LEAKED by retirement because
+        /// the io thread never proved completion (`io_done`) — the
+        /// abandoned-thread deferred-ownership rule in `retirePtySlot`.
+        /// A bounded diagnostic: nonzero only after a join-deadline
+        /// abandon, one per retired session.
+        pty_blocks_leaked: usize = 0,
+        /// Scratch a delivered output batch is copied into so the
+        /// event's byte slice stays valid while `update` runs.
+        pty_drain_scratch: [max_effect_pty_chunk_bytes]u8 = undefined,
         queue_mutex: SpinMutex = .{},
         queue: [max_effect_queue_entries]Entry = undefined,
         queue_head: usize = 0,
@@ -3600,6 +4337,13 @@ pub fn Effects(comptime Msg: type) type {
         /// Drain-pass counter (incremented in `drainBoundary`): the
         /// retired-video sweep's clock. Loop-thread only.
         drain_pass_seq: u64 = 0,
+        /// Loop-thread-only pty-terminal stage (see `PendingPty` for
+        /// the non-lossy contract) — the channel stage's storage
+        /// discipline exactly.
+        pending_ptys: [max_effect_pending_images_inline]PendingPty = undefined,
+        pending_pty_spill: []PendingPty = &.{},
+        pending_pty_head: usize = 0,
+        pending_pty_len: usize = 0,
         /// Loop-thread-only caller-staged Msg stage (see
         /// `PendingStaged` for the non-lossy contract) — the image
         /// stage's storage discipline exactly: inline until a burst
@@ -3609,6 +4353,18 @@ pub fn Effects(comptime Msg: type) type {
         pending_staged_spill: []PendingStaged = &.{},
         pending_staged_head: usize = 0,
         pending_staged_len: usize = 0,
+        /// INTERNED backing for the KEY bytes a staged Msg carries (a TS
+        /// bridge spawn-rejection names the app's requested key). A
+        /// staged Msg outlives the caller's frame arena, the caller has
+        /// no durable home for the key (a rejected spawn has no live
+        /// table slot), and the delivered Msg's consumer may COMMIT the
+        /// slice into its model — so these buffers are instance-lived,
+        /// freed only at deinit (each a stable heap allocation; the
+        /// pointer array may grow and move, the buffers never do).
+        /// Interning bounds the storage by the app's distinct key
+        /// vocabulary, not its rejection count.
+        staged_keys: [][]u8 = &.{},
+        staged_keys_len: usize = 0,
         /// Scratch the drained entry is copied into so its line slice
         /// stays valid while `update` runs (recycled per drained Msg).
         drain_scratch: Entry = .{},
@@ -3701,6 +4457,123 @@ pub fn Effects(comptime Msg: type) type {
             }
             self.releaseVideoSink();
             self.video = .{};
+            // Wind down every live pty BEFORE the channel sweep: the
+            // group kill forces the parent end to EOF, the io thread reaps
+            // and stages the exit as its last shared touch, and a
+            // bounded join collects it. Staged events are discarded, no
+            // Msg is delivered — the families' teardown discipline. An
+            // io thread still stuck at the deadline is abandoned with a
+            // teaching warning: everything it can still reach (the
+            // shared header, its staging ring, the transport fds) is
+            // process-lived or deliberately leaked with it.
+            for (&self.pty_slots) |*pty_slot| {
+                // Wind down a running REAL pty: kill and wait (bounded)
+                // for the io thread to stage its exit, then retire or
+                // abandon it. A fake or unsupported occupancy just
+                // clears. Idle slots fall straight to the wake quiesce
+                // below — their retained header may still carry an
+                // in-flight wake from a session that retired earlier
+                // this teardown (retirement only REVOKES, never waits).
+                if (comptime pty_transport.supported) {
+                    if (pty_slot.state == .running and !pty_slot.fake) {
+                        if (pty_slot.shared) |shared| {
+                            // Signal under the mutex, the ptyKill
+                            // discipline: check and kill are atomic
+                            // against the io thread's `reaping` publish,
+                            // so a reaped pid's reuse is never signalled.
+                            shared.mutex.lock();
+                            shared.shutdown = true;
+                            shared.kill_requested = true;
+                            if (!(shared.reaping or shared.exit_staged or shared.io_done)) {
+                                if (pty_slot.transport) |transport| transport.kill(false);
+                            }
+                            shared.mutex.unlock();
+                        } else if (pty_slot.transport) |transport| {
+                            transport.kill(false);
+                        }
+                        pty_transport.nudge(pty_slot.wake_pipe[1]);
+                        var io_done = pty_slot.shared == null;
+                        if (pty_slot.shared) |shared| {
+                            const start_ns = runtime_clock.monotonicNanoseconds();
+                            while (true) {
+                                shared.mutex.lock();
+                                io_done = shared.io_done;
+                                shared.mutex.unlock();
+                                if (io_done) break;
+                                const elapsed_ms = (runtime_clock.monotonicNanoseconds() - start_ns) / std.time.ns_per_ms;
+                                if (elapsed_ms >= self.spawn_join_deadline_ms) break;
+                                std.atomic.spinLoopHint();
+                            }
+                        }
+                        if (io_done) {
+                            self.retirePtySlot(pty_slot);
+                        } else {
+                            // Abandon: detach the io thread and leak what
+                            // it can still touch (its staging ring and
+                            // outbound block stay installed, the parent-
+                            // side fd stays open).
+                            if (comptime builtin.os.tag != .freestanding) {
+                                std.debug.print(
+                                    "effects teardown: a pty io thread is still running after {d}ms (a descendant may be holding the terminal open past the group kill); abandoning the thread and leaking its fds and staging so teardown can return safely\n",
+                                    .{self.spawn_join_deadline_ms},
+                                );
+                            }
+                            if (pty_slot.io_thread) |thread| {
+                                thread.detach();
+                                pty_slot.io_thread = null;
+                            }
+                            if (pty_slot.shared) |shared| {
+                                shared.mutex.lock();
+                                shared.open = false;
+                                shared.owner = null;
+                                shared.mutex.unlock();
+                            }
+                            pty_slot.state = .idle;
+                            pty_slot.on_event = null;
+                        }
+                    } else if (pty_slot.state != .idle) {
+                        pty_slot.state = .idle;
+                        pty_slot.on_event = null;
+                    }
+                    // Quiesce the wake header — for EVERY slot with one,
+                    // idle included: the header is process-lifetime and
+                    // reused, so a retired session's slow `wake_fn` may
+                    // still be in flight, and the services snapshot and
+                    // platform it dereferences are about to be freed. A
+                    // still-executing call at the deadline is abandoned,
+                    // counted, and the platform signalled to outlive it.
+                    //
+                    // The header itself is DELIBERATELY NEVER FREED — the
+                    // `ChannelShared` permanent-leak invariant, verbatim.
+                    // Quiescing proves only `in_flight == 0`, not that
+                    // the io thread has RETURNED: the thread publishes
+                    // its exit and then calls `requestHostWake`, and a
+                    // thread descheduled in that pre-wake window (or a
+                    // mid-life-retired, detached thread whose violating
+                    // wake still runs) will lock this header's wake mutex
+                    // later, so freeing it here would be a use-after-
+                    // free. The leak is bounded (at most `max_effect_ptys`
+                    // small headers per Effects instance — the ~64 KiB
+                    // outbound block and the staging ring freed at retire)
+                    // and never grows during a runtime's life (headers are
+                    // reused across sessions), matching every channel
+                    // header.
+                    if (pty_slot.shared) |shared| {
+                        if (!quiesceChannelWake(&shared.wake, self.channel_wake_join_deadline_ms)) {
+                            self.abandoned_channel_wakes += 1;
+                            if (self.services) |services| services.noteChannelWakeAbandoned();
+                        }
+                    }
+                } else if (pty_slot.state != .idle) {
+                    pty_slot.state = .idle;
+                    pty_slot.on_event = null;
+                }
+            }
+            self.pty_pending_count.store(0, .release);
+            // Settle any surrendered reap whose child has since died —
+            // teardown is the last cheap moment before the process
+            // would otherwise carry the zombie.
+            if (comptime pty_transport.supported) pty_transport.reapSurrendered();
             // Close every external-source channel FIRST among the
             // loop-side teardowns: clearing `open` under each shared
             // mutex fences the app's posting threads off this struct
@@ -3752,7 +4625,7 @@ pub fn Effects(comptime Msg: type) type {
                     // process-lived (the abandoned-worker idiom,
                     // applied to the platform itself; see
                     // `PlatformServices.note_channel_wake_abandoned_fn`).
-                    if (!quiesceChannelWake(shared, self.channel_wake_join_deadline_ms)) {
+                    if (!quiesceChannelWake(&shared.wake, self.channel_wake_join_deadline_ms)) {
                         self.abandoned_channel_wakes += 1;
                         if (self.services) |services| services.noteChannelWakeAbandoned();
                         if (comptime builtin.os.tag != .freestanding) {
@@ -4010,6 +4883,12 @@ pub fn Effects(comptime Msg: type) type {
                 self.allocator.free(self.pending_channel_spill);
                 self.pending_channel_spill = &.{};
             }
+            if (self.pending_pty_spill.len > 0) {
+                self.allocator.free(self.pending_pty_spill);
+                self.pending_pty_spill = &.{};
+            }
+            self.pending_pty_head = 0;
+            self.pending_pty_len = 0;
             self.pending_channel_head = 0;
             self.pending_channel_len = 0;
             // And undrained staged video events.
@@ -4038,6 +4917,19 @@ pub fn Effects(comptime Msg: type) type {
             }
             self.pending_staged_head = 0;
             self.pending_staged_len = 0;
+            // The durable key buffers those staged Msgs referenced.
+            self.releaseStagedKeys();
+            if (self.staged_keys.len > 0) {
+                self.allocator.free(self.staged_keys);
+                self.staged_keys = &.{};
+            }
+            // And an undrained replay write-verdict spill.
+            if (self.replay_pty_write_spill.len > 0) {
+                self.allocator.free(self.replay_pty_write_spill);
+                self.replay_pty_write_spill = &.{};
+            }
+            self.replay_pty_write_head = 0;
+            self.replay_pty_write_len = 0;
             // Sever the services binding last: the platform this pointer
             // reaches into may be destroyed before the next call arrives
             // (main's deferred app deinit runs after the runner's platform
@@ -4179,6 +5071,97 @@ pub fn Effects(comptime Msg: type) type {
                 for (&self.channel_slots) |*slot| {
                     if (slot.state == .open and slot.shared != null) self.closeChannel(slot.key);
                 }
+                // Running ptys arm the same producer-wake seam and hit
+                // the same dead end: their io thread could never wake
+                // the host. Wind each down — kill the child, wait
+                // (bounded) for the io thread to stage its exit, and
+                // past the deadline stage the cancelled terminal from
+                // this thread instead — so the exit is pending for the
+                // catch-up sweep below to deliver, never stranded.
+                // (Reachable only when a pty was spawned before
+                // `bindServices`, which the standard startup order
+                // never does; contained here regardless.)
+                if (comptime pty_transport.supported) {
+                    for (&self.pty_slots) |*pty_slot| {
+                        if (!(pty_slot.state == .running and !pty_slot.fake)) continue;
+                        const shared = pty_slot.shared orelse continue;
+                        shared.mutex.lock();
+                        shared.shutdown = true;
+                        shared.kill_requested = true;
+                        if (!(shared.reaping or shared.exit_staged or shared.io_done)) {
+                            if (pty_slot.transport) |transport| transport.kill(false);
+                        }
+                        shared.mutex.unlock();
+                        pty_transport.nudge(pty_slot.wake_pipe[1]);
+                        const start_ns = runtime_clock.monotonicNanoseconds();
+                        var io_done = false;
+                        while (true) {
+                            shared.mutex.lock();
+                            io_done = shared.io_done;
+                            shared.mutex.unlock();
+                            if (io_done) break;
+                            const elapsed_ms = (runtime_clock.monotonicNanoseconds() - start_ns) / std.time.ns_per_ms;
+                            if (elapsed_ms >= self.spawn_join_deadline_ms) break;
+                            std.atomic.spinLoopHint();
+                        }
+                        if (io_done) continue;
+                        // The io thread missed the deadline (a reap can
+                        // honestly take seconds). Leaving the slot as-is
+                        // would strand its exit: the staging the thread
+                        // eventually does could never wake the host —
+                        // the snapshot it wakes through is exactly what
+                        // failed to allocate. So stage the cancelled
+                        // terminal HERE, on the loop thread, and revoke
+                        // the session (`open = false`) so the thread's
+                        // own staging goes inert behind the same gates
+                        // stale channel posts fail; the sweep below
+                        // delivers it. The thread detaches, and its
+                        // transport, pipe fds, and heap blocks leak —
+                        // the teardown abandon rule applied mid-life:
+                        // exit delivery's retire must never close an fd
+                        // under a live reader (transport and pipe are
+                        // forgotten below), and it frees the staging
+                        // blocks only on the thread's own `io_done`
+                        // proof, never under a thread still running
+                        // (see `retirePtySlot`).
+                        shared.mutex.lock();
+                        const thread_settled = shared.exit_staged or shared.io_done;
+                        if (!thread_settled) {
+                            // Outbound staged at abandon never reaches
+                            // the child: fold it into dropped_writes,
+                            // the io thread's own exit-time rule.
+                            if (shared.out_len > 0) {
+                                shared.dropped_writes +|= @intCast(shared.out_write_count);
+                                shared.out_len = 0;
+                                shared.out_write_count = 0;
+                                shared.out_front_sent = 0;
+                            }
+                            shared.exit_reason = .cancelled;
+                            shared.exit_signal = 0;
+                            shared.exit_code = effect_error_exit_code;
+                            shared.exit_staged = true;
+                            if (shared.owner) |owner| {
+                                shared.exit_seq = owner.seq.fetchAdd(1, .seq_cst);
+                                _ = owner.pending.fetchAdd(1, .seq_cst);
+                            }
+                            shared.open = false;
+                        }
+                        shared.mutex.unlock();
+                        if (thread_settled) continue;
+                        if (comptime builtin.os.tag != .freestanding) {
+                            std.debug.print(
+                                "effects bindServices: a pty io thread is still running after {d}ms; staging its cancelled exit from the loop and abandoning the thread (its fds and staging leak)\n",
+                                .{self.spawn_join_deadline_ms},
+                            );
+                        }
+                        if (pty_slot.io_thread) |thread| {
+                            thread.detach();
+                            pty_slot.io_thread = null;
+                        }
+                        pty_slot.transport = null;
+                        pty_slot.wake_pipe = .{ -1, -1 };
+                    }
+                }
             }
             // Sweep unconditionally, snapshot or no snapshot: work
             // staged BEFORE this bind could never reach the host
@@ -4200,6 +5183,11 @@ pub fn Effects(comptime Msg: type) type {
             if (self.replay) return false;
             for (&self.channel_slots) |*slot| {
                 if (slot.state == .open and slot.shared != null) return true;
+            }
+            // Ptys arm the same producer-wake seam: a running REAL
+            // occupancy's io thread wakes through its shared header.
+            for (&self.pty_slots) |*slot| {
+                if (slot.state == .running and !slot.fake and slot.shared != null) return true;
             }
             return false;
         }
@@ -4399,6 +5387,202 @@ pub fn Effects(comptime Msg: type) type {
             const index = (self.replay_clock_head + self.replay_clock_len) % max_effect_replay_clock_entries;
             self.replay_clock[index] = value;
             self.replay_clock_len += 1;
+        }
+
+        /// The verdict queue's current backing storage —
+        /// `pendingStagedStorage`'s twin.
+        fn replayPtyWriteStorage(self: *Self) []ReplayPtyWriteVerdict {
+            if (self.replay_pty_write_spill.len > 0) return self.replay_pty_write_spill;
+            return &self.replay_pty_write_verdicts;
+        }
+
+        /// Queue one journaled `ptyWrite` admission verdict for a
+        /// replay-mode write (the `.pty`/`.write` record feed — the
+        /// clock queue's shape, growable past the inline window because
+        /// every verdict a dispatch recorded feeds BEFORE that dispatch
+        /// replays: a fixed bound would reject a valid recording whose
+        /// one update wrote more times than the bound).
+        pub fn pushReplayPtyWriteVerdict(self: *Self, key: u64, accepted: bool) error{EffectNotFound}!void {
+            const storage = self.replayPtyWriteStorage();
+            if (self.replay_pty_write_len == storage.len) {
+                const new_cap = storage.len * 2;
+                const grown = self.allocator.alloc(ReplayPtyWriteVerdict, new_cap) catch return error.EffectNotFound;
+                for (grown[0..self.replay_pty_write_len], 0..) |*slot, index| {
+                    slot.* = storage[(self.replay_pty_write_head + index) % storage.len];
+                }
+                if (self.replay_pty_write_spill.len > 0) self.allocator.free(self.replay_pty_write_spill);
+                self.replay_pty_write_spill = grown;
+                self.replay_pty_write_head = 0;
+            }
+            const active = self.replayPtyWriteStorage();
+            active[(self.replay_pty_write_head + self.replay_pty_write_len) % active.len] = .{
+                .key = key,
+                .accepted = accepted,
+            };
+            self.replay_pty_write_len += 1;
+        }
+
+        /// Verify every journaled replay feed was consumed exactly:
+        /// called at the journal's end (the `.finish` replay
+        /// control). A leftover write verdict means the replayed updates
+        /// wrote FEWER times than the recording; a recorded underflow
+        /// means they wrote MORE. Neither necessarily moves a
+        /// fingerprint checkpoint (a fire-and-forget caller ignores the
+        /// optimistic answer and changes no state), so the settle check
+        /// is what makes write-count divergence loud.
+        pub fn settleReplayFeeds(self: *Self) error{ReplayDivergence}!void {
+            // The clock feed settles by the same rule as the write
+            // verdicts: a `wallMs` read past the journaled values, or a
+            // journaled value never consumed, is divergence a checkpoint
+            // may not see (the optimistic 0 answer, or the skipped read,
+            // need not move any rendered state).
+            if (self.replay_clock_underflows > 0) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay diverged: {d} wallMs read(s) ran past the journaled clock values - the replayed updates read the clock more often than the recording did (nondeterminism outside the effect boundary?)\n",
+                        .{self.replay_clock_underflows},
+                    );
+                }
+                return error.ReplayDivergence;
+            }
+            if (self.replay_clock_len > 0) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay diverged: {d} journaled clock value(s) were never consumed - the replayed updates read the clock fewer times than the recording did (nondeterminism outside the effect boundary?)\n",
+                        .{self.replay_clock_len},
+                    );
+                }
+                return error.ReplayDivergence;
+            }
+            if (self.replay_pty_write_divergences > 0) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay diverged: {d} ptyWrite call(s) ran past the journaled verdicts or wrote to a different pty than the recording did (nondeterminism outside the effect boundary?)\n",
+                        .{self.replay_pty_write_divergences},
+                    );
+                }
+                return error.ReplayDivergence;
+            }
+            if (self.replay_pty_write_len > 0) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay diverged: {d} journaled ptyWrite verdict(s) were never consumed - the replayed updates wrote fewer times than the recording did (nondeterminism outside the effect boundary?)\n",
+                        .{self.replay_pty_write_len},
+                    );
+                }
+                return error.ReplayDivergence;
+            }
+            // Journaled environment deliveries never consumed settle by
+            // the clock's rule: the recording's app drained them through
+            // a channel this replay's app no longer has.
+            if (self.replay_env_len > 0) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay diverged: {d} journaled environment record(s) were never consumed - the replayed app drains fewer env deliveries than the recording did (a removed env channel?)\n",
+                        .{self.replay_env_len},
+                    );
+                }
+                return error.ReplayDivergence;
+            }
+            // Fed results still awaiting delivery — EVERY kind, not one
+            // family: the recorder journals every result at its live
+            // DELIVERY (inside a dispatched event that follows it in the
+            // stream), so a journal that ends with a fed result still
+            // queued was truncated past its consuming event, whatever
+            // the result's family. Succeeding here would silently omit
+            // a recorded delivery. Under replay the executor is the
+            // parking fake, so the completion queue can hold ONLY fed
+            // entries; the staged rings are checked with their
+            // regenerating rejections exempt — the live run could also
+            // end with one staged (it journals nothing until delivery),
+            // and the replayed dispatch restaged it identically. (The
+            // lossy pending ring is deliberately not swept: its entries
+            // are regenerating rejections, or feed fallbacks that only
+            // arise once the queue itself was full — which the sweep
+            // above already reports.)
+            var undelivered: usize = 0;
+            {
+                self.queue_mutex.lock();
+                defer self.queue_mutex.unlock();
+                undelivered += self.queue_len;
+            }
+            {
+                const storage = self.pendingPtyStorage();
+                var index: usize = 0;
+                while (index < self.pending_pty_len) : (index += 1) {
+                    const entry = &storage[(self.pending_pty_head + index) % storage.len];
+                    if (!entry.regenerates) undelivered += 1;
+                }
+            }
+            {
+                const storage = self.pendingChannelStorage();
+                var index: usize = 0;
+                while (index < self.pending_channel_len) : (index += 1) {
+                    const entry = &storage[(self.pending_channel_head + index) % storage.len];
+                    if (!entry.regenerates) undelivered += 1;
+                }
+            }
+            {
+                const storage = self.pendingImageStorage();
+                var index: usize = 0;
+                while (index < self.pending_image_len) : (index += 1) {
+                    const entry = &storage[(self.pending_image_head + index) % storage.len];
+                    if (!entry.regenerates) undelivered += 1;
+                }
+            }
+            if (undelivered > 0) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay diverged: {d} fed result(s) were never delivered - the journal ends before the event that consumed them live (truncated or hand-edited?)\n",
+                        .{undelivered},
+                    );
+                }
+                return error.ReplayDivergence;
+            }
+        }
+
+        /// Pop the next journaled write verdict for a replay-mode
+        /// `ptyWrite` against `key`. An empty queue, or a head verdict
+        /// recorded against a DIFFERENT pty, is a divergence signal (the
+        /// replayed update wrote more, or wrote elsewhere, than the
+        /// recording did); reported once and answered optimistically so
+        /// the dispatch can finish — the end-of-journal settle check
+        /// (`settleReplayFeeds`) turns the count into a loud replay
+        /// failure either way (a key mismatch also strands its verdict,
+        /// so the leftover check backstops it too).
+        fn takeReplayPtyWriteVerdict(self: *Self, key: u64) bool {
+            if (self.replay_pty_write_len == 0) {
+                self.replay_pty_write_divergences += 1;
+                if (self.replay_pty_write_divergences == 1 and comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "session replay: a ptyWrite found no journaled verdict - the replayed update writes more often than the recording did (nondeterministic control flow); answering accepted\n",
+                        .{},
+                    );
+                }
+                return true;
+            }
+            const storage = self.replayPtyWriteStorage();
+            const head = storage[self.replay_pty_write_head];
+            if (head.key != key) {
+                self.replay_pty_write_divergences += 1;
+                if (self.replay_pty_write_divergences == 1 and comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "session replay: a ptyWrite against key {d} found a verdict recorded against key {d} - the replayed update writes to a different pty than the recording did (nondeterministic control flow); answering accepted\n",
+                        .{ key, head.key },
+                    );
+                }
+                return true;
+            }
+            self.replay_pty_write_head = (self.replay_pty_write_head + 1) % storage.len;
+            self.replay_pty_write_len -= 1;
+            if (self.replay_pty_write_len == 0) {
+                self.replay_pty_write_head = 0;
+                if (self.replay_pty_write_spill.len > 0) {
+                    self.allocator.free(self.replay_pty_write_spill);
+                    self.replay_pty_write_spill = &.{};
+                }
+            }
+            return head.accepted;
         }
 
         /// Journal one launch-env delivery (an `.env` record): the TS
@@ -5192,7 +6376,7 @@ pub fn Effects(comptime Msg: type) type {
                 // header on its own time. Never a quiescing wait here —
                 // this close may BE the dispatch a synchronous-marshal
                 // `wake_fn` is waiting on (see `revokeChannelWake`).
-                revokeChannelWake(shared);
+                revokeChannelWake(&shared.wake);
             }
             // Replay mode: the recorded session already journaled this
             // channel's `.closed` terminal, and feeding that record is
@@ -5346,6 +6530,584 @@ pub fn Effects(comptime Msg: type) type {
                 slot.park_state = if (kind == .closed) .terminated else .vacated;
             }
             self.wakeHost();
+        }
+
+        /// Feed a RECORDED pty output batch — the session-replay feed
+        /// and the scriptable fake pty's output seam: the bytes deliver
+        /// verbatim through the occupied slot's `on_event` at the next
+        /// drain, in queue order with every other fed result. Batches
+        /// past the inline entry bound ride a heap payload (the raised
+        /// line-bound discipline). Live REAL occupancies refuse the
+        /// feed — fed events are for parked fakes and replay, never a
+        /// second producer beside a live io thread.
+        pub fn feedPtyOutput(self: *Self, key: u64, bytes: []const u8) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, PtyChunkTooLarge, ReplayDamagedRecord }!void {
+            const slot_index = blk: {
+                for (&self.pty_slots, 0..) |*slot, index| {
+                    if (slot.state != .idle and slot.key == key) break :blk index;
+                }
+                return error.EffectNotFound;
+            };
+            const slot = &self.pty_slots[slot_index];
+            if (!slot.fake) return error.PtyLiveFeed;
+            if (slot.park_state == .terminated) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay refused: pty record for key {d} feeds output after the spawn's terminal already fed - a pty delivers nothing past its exit (one terminal per spawn), so the journal is damaged or hand-edited; re-record the session\n",
+                        .{key},
+                    );
+                }
+                return error.ReplayDamagedRecord;
+            }
+            // One batch never exceeds the chunk bound (the live ring
+            // splits at it, and the replay damage gate refuses a bigger
+            // record) — reject an over-bound feed rather than deliver a
+            // silently truncated prefix.
+            if (bytes.len > max_effect_pty_chunk_bytes) return error.PtyChunkTooLarge;
+            // Empty output is a no-op: the live drain only ever delivers
+            // a non-empty batch, so journaling an empty one would write
+            // a zero-length blob record that replay refuses as damage.
+            // A fake feed of "" simply delivers nothing.
+            if (bytes.len == 0) return;
+            const staged_len = bytes.len;
+            var entry: Entry = .{
+                .kind = .pty,
+                .slot_index = @intCast(slot_index),
+                .channel_generation = slot.generation,
+                .key = key,
+                .line_len = @intCast(staged_len),
+                .pty_kind = .output,
+                // A non-exit event carries the -1 code sentinel, matching
+                // the live drain's `EffectPtyEvent` default (whose `code`
+                // is `effect_error_exit_code`). Without this the Entry's
+                // own `code` default of 0 would make a replayed output
+                // batch deliver code 0 where the live run delivered -1 —
+                // a deterministic-state divergence for an app that folds
+                // the code into its model.
+                .code = effect_error_exit_code,
+            };
+            if (staged_len > entry.line_bytes.len) {
+                const heap = self.allocator.alloc(u8, staged_len) catch return error.EffectQueueFull;
+                @memcpy(heap[0..staged_len], bytes[0..staged_len]);
+                entry.heap_line = heap;
+            } else {
+                @memcpy(entry.line_bytes[0..staged_len], bytes[0..staged_len]);
+            }
+            if (!self.enqueue(&entry)) {
+                if (entry.heap_line) |heap| self.allocator.free(heap);
+                return error.EffectQueueFull;
+            }
+            // The first fed event proves the spawn started live: the
+            // park's pending-order reservation vacates unused.
+            if (slot.park_state == .reserved) slot.park_state = .vacated;
+            self.wakeHost();
+        }
+
+        /// Feed a RECORDED pty exit — the terminal half of the replay
+        /// feed and the fake pty's scripted ending. Start failures
+        /// (`.rejected`, `.spawn_failed`) resolve a replay park's
+        /// pending-order reservation and deliver at the spawn's
+        /// dispatch position (the channel park dance); real endings
+        /// ride the completion queue and retire the slot at delivery.
+        pub fn feedPtyExit(self: *Self, key: u64, code: i32, signal: i32, reason: EffectExitReason, dropped_writes: u32) error{ EffectNotFound, EffectQueueFull, PtyLiveFeed, ReplayDamagedRecord }!void {
+            const slot_index = blk: {
+                for (&self.pty_slots, 0..) |*slot, index| {
+                    if (slot.state != .idle and slot.key == key) break :blk index;
+                }
+                return error.EffectNotFound;
+            };
+            const slot = &self.pty_slots[slot_index];
+            if (!slot.fake) return error.PtyLiveFeed;
+            // Normalize the tuple to the EffectPtyEvent contract the live
+            // io loop guarantees, so a fake (test or replay) can never
+            // stage an event the recorder journals but replay's damage
+            // gate then refuses: a signal is meaningful only after a
+            // `.signaled` end, and a code only after an `.exited` one —
+            // every other reason carries the -1 sentinel. This clamps at
+            // the feed boundary rather than trusting the caller.
+            const norm_signal: i32 = if (reason == .signaled) signal else 0;
+            const norm_code: i32 = if (reason == .exited) code else effect_error_exit_code;
+            // The contract is a BICONDITIONAL: `.signaled` also REQUIRES a
+            // nonzero signal (replay's gate treats `signaled != (signal !=
+            // 0)` as damage). The live io loop never sets `.signaled`
+            // without a real signal, so a signaled feed carrying zero is
+            // malformed and cannot map to any recordable exit — refuse it
+            // loudly rather than journal a record replay would reject.
+            if (reason == .signaled and norm_signal == 0) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay refused: pty record for key {d} feeds a .signaled exit with signal 0 - a signaled end names its fatal signal (the live transport never reports zero), so the journal is damaged or hand-edited; re-record the session\n",
+                        .{key},
+                    );
+                }
+                return error.ReplayDamagedRecord;
+            }
+            // Range-gate the values to what waitpid's status word can
+            // produce: exit codes 0..255 (plus the documented -1 for a
+            // child reaped outside the toolkit), signals 1..127. Feeding
+            // anything else would journal an event replay's damage gate
+            // refuses — the signaled-zero rule, extended to the ranges.
+            if (reason == .signaled and (norm_signal < 1 or norm_signal > 127)) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay refused: pty record for key {d} feeds a .signaled exit with signal {d} - waitpid can only report signals 1..127, so the journal is damaged or hand-edited; re-record the session\n",
+                        .{ key, norm_signal },
+                    );
+                }
+                return error.ReplayDamagedRecord;
+            }
+            if (reason == .exited and norm_code != effect_error_exit_code and (norm_code < 0 or norm_code > 255)) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay refused: pty record for key {d} feeds an .exited end with code {d} - waitpid can only report exit codes 0..255 (or the -1 externally-reaped sentinel), so the journal is damaged or hand-edited; re-record the session\n",
+                        .{ key, norm_code },
+                    );
+                }
+                return error.ReplayDamagedRecord;
+            }
+            if (slot.park_state == .terminated) {
+                if (comptime builtin.os.tag != .freestanding) {
+                    std.debug.print(
+                        "replay refused: pty record for key {d} feeds a second terminal - a pty delivers exactly one exit per spawn, so the journal is damaged or hand-edited; re-record the session\n",
+                        .{key},
+                    );
+                }
+                return error.ReplayDamagedRecord;
+            }
+            // The delivered drop count is the fed (transport-reported)
+            // count PLUS the refusals the fake itself counted onto the
+            // slot (an oversized write, or a write after this exit was
+            // staged — both mirror the live admission path). The fold
+            // happens AT DELIVERY, the live staged-exit drain's rule, so
+            // a refusal between this feed and the drain still lands in
+            // the delivered tally; the entry carries only the fed count.
+            // Under session replay the slot count is always zero
+            // (replay-mode writes never reach the fake admission path),
+            // so a replayed exit delivers exactly the journaled count.
+            const start_failure = reason == .rejected or reason == .spawn_failed;
+            if (start_failure) {
+                // A start failure the recorded spawn produced at
+                // dispatch: reclaim the park's stamp (one per spawn)
+                // and deliver through the pending stage, retiring the
+                // parked slot at delivery. Outside replay (a plain
+                // fake), there is no reservation — stamp now.
+                if (slot.park_state == .vacated) {
+                    if (comptime builtin.os.tag != .freestanding) {
+                        std.debug.print(
+                            "replay refused: pty record for key {d} feeds a start-failure terminal into a spawn the stream already proved started, so the journal is damaged or hand-edited; re-record the session\n",
+                            .{key},
+                        );
+                    }
+                    return error.ReplayDamagedRecord;
+                }
+                const seq = if (slot.park_state == .reserved) slot.park_seq else self.nextPendingSeq();
+                slot.park_state = .terminated;
+                self.stagePendingPty(.{
+                    .seq = seq,
+                    .event = .{
+                        .key = key,
+                        .kind = .exit,
+                        .code = norm_code,
+                        .reason = reason,
+                        .signal = norm_signal,
+                        .dropped_writes = dropped_writes,
+                    },
+                    .pty_fn = slot.on_event,
+                    .regenerates = false,
+                    .retire_slot = slot_index,
+                    .retire_generation = slot.generation,
+                });
+                return;
+            }
+            var entry: Entry = .{
+                .kind = .pty,
+                .slot_index = @intCast(slot_index),
+                .channel_generation = slot.generation,
+                .key = key,
+                .pty_kind = .exit,
+                .code = norm_code,
+                .reason = reason,
+                .pty_signal = norm_signal,
+                .pty_dropped_writes = dropped_writes,
+            };
+            if (!self.enqueue(&entry)) return error.EffectQueueFull;
+            // One terminal per spawn, on every fake — not just replay
+            // parks: mark terminated so a second output or exit fed
+            // before this one drains is refused loudly instead of
+            // enqueued and then silently dropped by the delivery
+            // generation gate once the exit retires the slot.
+            slot.park_state = .terminated;
+            self.wakeHost();
+        }
+
+        /// Number of recorded (still-active) fake pty spawns.
+        pub fn pendingPtyCount(self: *Self) usize {
+            var count: usize = 0;
+            for (&self.pty_slots) |*slot| {
+                if (slot.fake and slot.state == .running) count += 1;
+            }
+            return count;
+        }
+
+        /// The `index`th active fake pty spawn request (insertion
+        /// order over the fixed table). Slices borrow slot storage —
+        /// valid until the occupancy retires.
+        pub fn pendingPtyAt(self: *Self, index: usize) ?PtyRequest {
+            var seen: usize = 0;
+            for (&self.pty_slots) |*slot| {
+                if (!(slot.fake and slot.state == .running)) continue;
+                if (seen == index) {
+                    return .{
+                        .key = slot.key,
+                        .argv = slot.requestArgv(),
+                        .cols = slot.cols,
+                        .rows = slot.rows,
+                        .term = slot.requestTerm(),
+                    };
+                }
+                seen += 1;
+            }
+            return null;
+        }
+
+        /// Everything the app wrote toward a fake pty (the newest
+        /// `max_effect_pty_write_capture_bytes` of it) — the test seam
+        /// proving "the app typed ls\n".
+        pub fn ptyWrittenBytes(self: *Self, key: u64) []const u8 {
+            const slot = self.findPtySlot(key) orelse return "";
+            return slot.write_capture[0..slot.write_capture_len];
+        }
+
+        /// The grid the pty currently declares (spawn size, updated by
+        /// `ptyResize`).
+        pub fn ptySize(self: *Self, key: u64) ?struct { cols: u16, rows: u16 } {
+            const slot = self.findPtySlot(key) orelse return null;
+            return .{ .cols = slot.cols, .rows = slot.rows };
+        }
+
+        /// Whether `ptyKill` ran against the occupancy (the fake pty's
+        /// kill mirror; the test answers it by feeding the exit).
+        pub fn ptyKillRequested(self: *Self, key: u64) bool {
+            const slot = self.findPtySlot(key) orelse return false;
+            return slot.kill_requested;
+        }
+
+        /// Spawn a command onto a fresh pseudo-terminal and stream its
+        /// output back as coalesced `on_event` Msgs — a spawn with a
+        /// different transport: same argv budgets, same key space, the
+        /// same environment policy (`bindEnviron`), and the same
+        /// permission/manifest kind (`command`). Never fails from the
+        /// caller's view: requests that cannot run deliver exactly one
+        /// `.exit` event with reason `.rejected` on the next drain, and
+        /// a transport that cannot start (no pty, missing binary)
+        /// delivers `.spawn_failed`. Output pacing is the whole point:
+        /// bytes arriving between drains coalesce into batches of at
+        /// most `max_effect_pty_chunk_bytes`, so a fast producer costs
+        /// per-drain Msgs (and journal records), never per-read ones.
+        /// Under session replay nothing spawns — the journaled batches
+        /// and exit ARE the session (`feedPtyOutput`/`feedPtyExit`).
+        pub fn ptySpawn(self: *Self, options: PtySpawnOptions) void {
+            self.reclaimSlots();
+            if (options.argv.len == 0 or options.argv.len > max_effect_argv) {
+                return self.rejectPty(options.key, options.on_event, true);
+            }
+            var total_bytes: usize = 0;
+            for (options.argv) |arg| {
+                total_bytes += arg.len;
+                // An embedded NUL would be silently truncated at the C
+                // boundary — reject the spawn rather than hand the child
+                // a cut argument (validated here so the fake executor
+                // and replay refuse identically, before the real
+                // transport's own guard).
+                if (std.mem.indexOfScalar(u8, arg, 0) != null) return self.rejectPty(options.key, options.on_event, true);
+            }
+            if (total_bytes > max_effect_argv_bytes) return self.rejectPty(options.key, options.on_event, true);
+            if (options.cols == 0 or options.rows == 0) return self.rejectPty(options.key, options.on_event, true);
+            if (options.term.len == 0 or options.term.len > max_effect_pty_term_bytes) {
+                return self.rejectPty(options.key, options.on_event, true);
+            }
+            // TERM rides the child environment; an embedded NUL would
+            // truncate it at the C boundary, so a spawn that "succeeded"
+            // would hand the child a different TERM than requested.
+            if (std.mem.indexOfScalar(u8, options.term, 0) != null) return self.rejectPty(options.key, options.on_event, true);
+            if (self.keyOccupiedUntilDelivery(options.key)) return self.rejectPty(options.key, options.on_event, true);
+            const slot_index = self.findIdlePtySlot() orelse return self.rejectPty(options.key, options.on_event, true);
+            // Table capacity obeys the replay-hold invariant, the
+            // channel argument verbatim: executor-truth start failures
+            // park a real slot under replay until the journaled
+            // terminal feeds, so live holds the open counted through
+            // the staged window too.
+            if (self.idlePtySlotCount() <= self.stagedPtyReservationCount()) {
+                return self.rejectPty(options.key, options.on_event, true);
+            }
+            // A build without a pty transport (Windows until ConPTY
+            // lands; a libc-free Linux build) refuses up front. Unlike
+            // the argv/dims/key bounds above, this is EXECUTOR TRUTH,
+            // not regenerating validation: whether a spawn can start is
+            // a property of the recording host, so the rejection is
+            // journaled (`regenerates = false`) and FED under replay —
+            // a session recorded where ptys are unsupported replays its
+            // rejection verbatim on a host where they are supported (and
+            // the replay executor is always the fake, which parks every
+            // spawn), instead of the replayed spawn parking with no
+            // journaled terminal to retire it.
+            if (comptime !pty_transport.supported) {
+                if (self.executor != .fake) return self.rejectPty(options.key, options.on_event, false);
+            }
+
+            const slot = &self.pty_slots[slot_index];
+            const generation = self.nextChannelGeneration();
+            slot.* = .{
+                .state = .running,
+                .key = options.key,
+                .generation = generation,
+                .on_event = options.on_event,
+                .fake = self.executor == .fake,
+                .shared = slot.shared,
+                .cols = options.cols,
+                .rows = options.rows,
+            };
+            slot.argv_count = options.argv.len;
+            var offset: usize = 0;
+            for (options.argv, 0..) |arg, index| {
+                @memcpy(slot.argv_storage[offset .. offset + arg.len], arg);
+                slot.argv_slices[index] = slot.argv_storage[offset .. offset + arg.len];
+                offset += arg.len;
+            }
+            @memcpy(slot.term_storage[0..options.term.len], options.term);
+            slot.term_len = options.term.len;
+
+            if (slot.fake) {
+                // Session replay: PARK — the fake-slot discipline. The
+                // stamp reserves the pending-order position a live
+                // executor-truth start failure would have staged at
+                // (see `ParkOrderState`); the fed terminal resolves
+                // which case this spawn was.
+                if (self.replay) {
+                    slot.park_seq = self.nextPendingSeq();
+                    slot.park_state = .reserved;
+                }
+                return;
+            }
+            self.startRealPty(slot, options);
+        }
+
+        /// Write bytes toward the pty child's stdin, all-or-nothing.
+        /// RETURNS whether the whole payload was accepted: false means it
+        /// was refused (an unknown/exited key, a payload over
+        /// `max_effect_pty_write_bytes`, or a full outbound buffer/record
+        /// ring against a child that stopped reading) and, being
+        /// all-or-nothing, no prefix was queued. A fire-and-forget caller
+        /// (a keystroke) may ignore the result — a refusal still counts
+        /// into the exit event's `dropped_writes`, never silence — while a
+        /// caller that must not lose bytes (a large paste) retains the
+        /// payload on false and retries as the child reads and the FIFO
+        /// drains. The truth is a single admission decision, so the caller
+        /// never has to model the byte and record limits itself.
+        ///
+        /// The verdict is EXECUTOR TRUTH — live it depends on how fast
+        /// the child drained the FIFO — so while a session records, every
+        /// verdict journals (a `.pty`/`.write` record), and under session
+        /// replay the write is inert but RETURNS THE RECORDED VERDICT
+        /// (fed like every other executor truth, never recomputed): an
+        /// app that retains refused bytes takes the identical
+        /// retain/remove path in both runs. The journal/feed boundary is
+        /// exact: a verdict is journaled (and consumed) iff the key names
+        /// a live occupancy and the payload is non-empty — both
+        /// deterministic across the replayed dispatch stream.
+        pub fn ptyWrite(self: *Self, key: u64, bytes: []const u8) bool {
+            const slot = self.findPtySlot(key) orelse {
+                // A spawn whose transport failed SYNCHRONOUSLY released
+                // its slot, but its staged executor-truth terminal keeps
+                // the key occupied until delivery — and REPLAY keeps that
+                // same window occupied as a parked slot, where a write
+                // consumes a verdict. Journal the refusal AND count it
+                // into the staged terminal's tally (this terminal has no
+                // slot left to carry drops to delivery), so the verdict
+                // streams stay aligned and the delivered exit reports the
+                // refusal — never silence. A key with no spawn at all
+                // refuses with no verdict on both sides (no slot, no
+                // park).
+                if (bytes.len > 0 and !self.replay and self.countRefusalOnStagedPtyTerminal(key)) {
+                    self.journalNote(.{
+                        .kind = .pty,
+                        .key = key,
+                        .pty_kind = .write,
+                        .code = 0,
+                    });
+                }
+                return false;
+            };
+            if (bytes.len == 0) return true;
+            if (self.replay) return self.takeReplayPtyWriteVerdict(key);
+            const accepted = self.ptyWriteAdmit(slot, bytes);
+            self.journalNote(.{
+                .kind = .pty,
+                .key = key,
+                .pty_kind = .write,
+                .code = if (accepted) 1 else 0,
+            });
+            return accepted;
+        }
+
+        /// The admission decision behind `ptyWrite` — the live half the
+        /// journaled verdict records.
+        fn ptyWriteAdmit(self: *Self, slot: *PtySlot, bytes: []const u8) bool {
+            if (slot.fake) {
+                // The fed exit is staged (one terminal per spawn, marked
+                // `.terminated`): the session is already over, so a late
+                // write refuses and counts — the LIVE admission path's
+                // staged-exit rule, mirrored so scripted sessions report
+                // the same dropped tally a real transport would.
+                if (slot.park_state == .terminated) {
+                    slot.dropped_writes +|= 1;
+                    return false;
+                }
+                // The scripted full-FIFO stand-in (see
+                // `fake_pty_write_full`): refuse and count like the live
+                // admission against a child that stopped reading.
+                if (self.fake_pty_write_full) {
+                    slot.dropped_writes +|= 1;
+                    return false;
+                }
+                if (bytes.len > max_effect_pty_write_bytes) {
+                    slot.dropped_writes +|= 1;
+                    return false;
+                }
+                // Capture for `ptyWrittenBytes`, oldest dropped past
+                // the window (an inspection seam, not a delivery).
+                if (bytes.len >= slot.write_capture.len) {
+                    @memcpy(slot.write_capture[0..slot.write_capture.len], bytes[bytes.len - slot.write_capture.len ..]);
+                    slot.write_capture_len = slot.write_capture.len;
+                } else {
+                    if (slot.write_capture_len + bytes.len > slot.write_capture.len) {
+                        const keep = slot.write_capture.len - bytes.len;
+                        const shift = slot.write_capture_len - keep;
+                        std.mem.copyForwards(u8, slot.write_capture[0..keep], slot.write_capture[shift..slot.write_capture_len]);
+                        slot.write_capture_len = keep;
+                    }
+                    @memcpy(slot.write_capture[slot.write_capture_len .. slot.write_capture_len + bytes.len], bytes);
+                    slot.write_capture_len += bytes.len;
+                }
+                return true;
+            }
+            if (comptime !pty_transport.supported) return false;
+            const shared = slot.shared orelse return false;
+            shared.mutex.lock();
+            const accepted = accepted: {
+                if (!shared.open or shared.generation != slot.generation) break :accepted false;
+                // The reaper has finished (exit staged): there is no io
+                // thread left to send bytes, so a late write must not
+                // queue bytes nobody will flush. It still COUNTS — the
+                // no-silent-refusal contract: the exit event reads
+                // `dropped_writes` under this mutex at drain delivery,
+                // which has not happened yet (the loop thread is here),
+                // so the refusal lands in the delivered count. Only a
+                // write after the exit DELIVERS misses it, and that one
+                // finds no slot at all (the documented cancel race).
+                if (shared.exit_staged or shared.io_done) {
+                    shared.dropped_writes +|= 1;
+                    break :accepted false;
+                }
+                if (bytes.len > max_effect_pty_write_bytes or
+                    shared.out_len + bytes.len > max_effect_pty_outbound_bytes or
+                    shared.out_write_count == max_effect_pty_write_records)
+                {
+                    // Refused: over-bound, the byte FIFO is full, or the
+                    // per-payload record ring is full (a child that
+                    // stopped reading). Counted as one dropped write, so
+                    // the count stays EXACT — admission is bounded by
+                    // both the byte buffer and the record ring, so an
+                    // accepted write always has an exact record and the
+                    // fold that would undercount never happens.
+                    shared.dropped_writes +|= 1;
+                    break :accepted false;
+                }
+                const outbound = shared.outbound.?;
+                var index: usize = 0;
+                while (index < bytes.len) : (index += 1) {
+                    outbound.data[(shared.out_head + shared.out_len + index) % max_effect_pty_outbound_bytes] = bytes[index];
+                }
+                shared.out_len += bytes.len;
+                outbound.write_lens[(shared.out_write_head + shared.out_write_count) % max_effect_pty_write_records] = @intCast(bytes.len);
+                shared.out_write_count += 1;
+                break :accepted true;
+            };
+            shared.mutex.unlock();
+            if (accepted) pty_transport.nudge(slot.wake_pipe[1]);
+            return accepted;
+        }
+
+        /// Push a new grid size to the pty so the child receives
+        /// SIGWINCH. Fire-and-forget like `ptyWrite`; zero dimensions
+        /// are clamped to 1 by the transport. The size mirrors update
+        /// either way so tests and the fake pty read the declared grid.
+        pub fn ptyResize(self: *Self, key: u64, cols: u16, rows: u16) void {
+            const slot = self.findPtySlot(key) orelse return;
+            slot.cols = if (cols == 0) 1 else cols;
+            slot.rows = if (rows == 0) 1 else rows;
+            if (slot.fake) return;
+            if (comptime !pty_transport.supported) return;
+            if (slot.transport) |transport| transport.resize(slot.cols, slot.rows);
+        }
+
+        /// Terminate the pty child: SIGKILL to its process group (the
+        /// child owns its session, so the signal reaches the whole
+        /// foreground job — a descendant that re-grouped itself escapes,
+        /// the spawn family's documented limit; POSIX has no
+        /// kill-whole-session primitive), after which the io thread
+        /// reaps and the exit delivers with reason `.cancelled` — after
+        /// this verb the exit always reports `.cancelled`, the spawn
+        /// cancel convention. Unknown keys are a no-op; on a fake pty
+        /// the kill is recorded (`ptyKillRequested`) and the test feeds
+        /// the exit.
+        pub fn ptyKill(self: *Self, key: u64) void {
+            const slot = self.findPtySlot(key) orelse return;
+            slot.kill_requested = true;
+            if (slot.fake) return;
+            if (comptime !pty_transport.supported) return;
+            const shared = slot.shared orelse return;
+            shared.mutex.lock();
+            shared.kill_requested = true;
+            // A kill racing the reap still keeps the contract: an exit
+            // already staged but not yet delivered rewrites to
+            // `.cancelled` with the -1 sentinel code — after this verb
+            // the exit always says cancelled, never a stale child code.
+            // Signal ONLY while the io thread has not begun reaping,
+            // and do it UNDER THE MUTEX so the check and the signal are
+            // atomic against the io thread: the io thread sets `reaping`
+            // under this same mutex before its first waitpid, so either
+            // we acquire first (reaping false → the child is unwaited
+            // and alive → the signal is safe) or it acquires first
+            // (reaping true → we skip). Once `reaping` is set the pid
+            // may be freed for reuse the instant a reap returns, so
+            // signalling then could hit an unrelated process. kill() is
+            // a bounded, non-blocking syscall, so holding the spin mutex
+            // across it is fine. The nudge (outside the lock) still
+            // wakes a read parked short of EOF through the
+            // kill_requested break.
+            //
+            // `reaping == false` proves pid ownership ONLY under the
+            // toolkit's reaping contract (documented on
+            // `EffectPtyEvent.code`): the toolkit forks the pty child,
+            // is its SOLE reaper, and never touches SIGCHLD disposition
+            // — an embedder must not either. An embedder that ignores
+            // SIGCHLD (kernel auto-reap), installs `SA_NOCLDWAIT`, or
+            // wait()s on children it did not spawn frees the pid outside
+            // this fence, and no portable POSIX primitive can close that:
+            // kill-by-pid is inherently check-then-act against a reaper
+            // you do not control (a race-free handle needs Linux-only
+            // pidfd_send_signal). The contract is the boundary; inside
+            // it this fence is exact.
+            if (shared.exit_staged) {
+                shared.exit_reason = .cancelled;
+                shared.exit_code = effect_error_exit_code;
+                shared.exit_signal = 0;
+            }
+            if (!(shared.reaping or shared.exit_staged or shared.io_done)) {
+                if (slot.transport) |transport| transport.kill(false);
+            }
+            shared.mutex.unlock();
+            pty_transport.nudge(slot.wake_pipe[1]);
         }
 
         /// Put text on the system clipboard through the platform
@@ -5527,6 +7289,16 @@ pub fn Effects(comptime Msg: type) type {
             // way: from open (or a staged executor-truth rejection)
             // until the terminal delivers, live and replayed alike.
             if (self.channelOccupiesKey(options.key) or self.stagedChannelOccupiesKey(options.key)) {
+                return self.rejectHost(options.key, options.on_result);
+            }
+            // Pty occupancies too: from spawn until the `.exit`
+            // terminal delivers, plus the staged executor-truth
+            // start-failure window — the same shared-namespace rule
+            // every other keyed issuer applies through
+            // `keyOccupiedUntilDelivery` (this pre-flight enumerates
+            // the families inline only because a same-key HOST
+            // occupancy is replaced, never rejected).
+            if (self.ptyOccupiesKey(options.key) or self.stagedPtyOccupiesKey(options.key)) {
                 return self.rejectHost(options.key, options.on_result);
             }
             const slot_index = blk: {
@@ -6945,8 +8717,10 @@ pub fn Effects(comptime Msg: type) type {
                 self.pending_image_len > 0 or
                 self.pending_channel_len > 0 or
                 self.pending_video_len > 0 or
+                self.pending_pty_len > 0 or
                 self.pending_staged_len > 0 or
                 self.channel_pending_count.load(.seq_cst) > 0 or
+                self.pty_pending_count.load(.seq_cst) > 0 or
                 self.queue_count.load(.seq_cst) > 0;
         }
 
@@ -6981,6 +8755,14 @@ pub fn Effects(comptime Msg: type) type {
             /// the coalescer cleared at the pass boundary guarantees
             /// one — the same causality cut the other two fields make.
             channel_before: u64,
+            /// Pty output backlogs and exits stamped before the pass:
+            /// `pty_seq` stamps below this deliver. One deliberate
+            /// nuance of the byte-stream shape: bytes appended to an
+            /// ALREADY-STAMPED backlog ride its batch even mid-pass —
+            /// a single producer's byte stream has inherent order and
+            /// the journal records exactly what delivered, so the
+            /// causality cut only needs the stamp, not the bytes.
+            pty_before: u64,
         };
 
         /// Snapshot the completion backlog at the start of one drain
@@ -7008,6 +8790,12 @@ pub fn Effects(comptime Msg: type) type {
                 shared.wake.pending.store(false, .seq_cst);
                 shared.wake.mutex.unlock();
             }
+            for (&self.pty_slots) |*slot| {
+                const shared = slot.shared orelse continue;
+                shared.wake.mutex.lock();
+                shared.wake.pending.store(false, .seq_cst);
+                shared.wake.mutex.unlock();
+            }
             return .{
                 .pending_before = self.pending_seq,
                 .queue_budget = self.queue_count.load(.acquire),
@@ -7015,6 +8803,7 @@ pub fn Effects(comptime Msg: type) type {
                 // flag check (see `requestHostWake`): a post ordered
                 // before the clear above is inside this snapshot.
                 .channel_before = self.channel_seq.load(.seq_cst),
+                .pty_before = self.pty_seq.load(.seq_cst),
             };
         }
 
@@ -7031,6 +8820,7 @@ pub fn Effects(comptime Msg: type) type {
                 .pending_before = std.math.maxInt(u64),
                 .queue_budget = std.math.maxInt(usize),
                 .channel_before = std.math.maxInt(u64),
+                .pty_before = std.math.maxInt(u64),
             };
             return self.takeMsgWithin(&unbounded);
         }
@@ -7267,6 +9057,44 @@ pub fn Effects(comptime Msg: type) type {
                             const channel_fn = entry.channel_fn orelse continue;
                             return channel_fn(entry.event);
                         },
+                        .pty => |entry| {
+                            // A fed park-retiring start failure frees
+                            // its parked slot before the Msg reaches
+                            // update — the channel discipline. The drop
+                            // count folds in the slot's own tally AT
+                            // DELIVERY (the live staged-exit drain's
+                            // rule): a write refused after the feed
+                            // still lands in the delivered count.
+                            var event = entry.event;
+                            if (entry.retire_slot) |slot_index| {
+                                const parked = &self.pty_slots[slot_index];
+                                if (parked.state != .idle and parked.generation == entry.retire_generation) {
+                                    event.dropped_writes +|= parked.dropped_writes;
+                                    self.retirePtySlot(parked);
+                                }
+                            }
+                            // Provenance rides `truncated` (unused for
+                            // pty records): a pty exit's `reason` is
+                            // meaningful data, so unlike channels it
+                            // cannot double as the regenerating marker.
+                            // Only deterministic admission refusals
+                            // regenerate under replay and are skipped;
+                            // executor-truth terminals (start failures,
+                            // and the platform-unsupported rejection)
+                            // keep `truncated = false` and feed.
+                            self.journalNote(.{
+                                .kind = .pty,
+                                .key = event.key,
+                                .pty_kind = event.kind,
+                                .code = event.code,
+                                .exit_reason = event.reason,
+                                .pty_signal = event.signal,
+                                .pty_dropped_writes = event.dropped_writes,
+                                .truncated = entry.regenerates,
+                            });
+                            const pty_fn = entry.pty_fn orelse continue;
+                            return pty_fn(event);
+                        },
                         .staged => |msg| {
                             // Deliberately NO journal record: a
                             // caller-staged Msg is regenerating by
@@ -7280,6 +9108,7 @@ pub fn Effects(comptime Msg: type) type {
                     }
                 }
                 if (self.takeChannelStagedMsg(boundary.channel_before)) |msg| return msg;
+                if (self.takePtyStagedMsg(boundary.pty_before)) |msg| return msg;
                 if (boundary.queue_budget == 0) return null;
                 if (!self.dequeueInto(&self.drain_scratch)) return null;
                 boundary.queue_budget -= 1;
@@ -7728,6 +9557,63 @@ pub fn Effects(comptime Msg: type) type {
                         const deliver_fn = on_event orelse continue;
                         return deliver_fn(event);
                     },
+                    .pty => {
+                        // A fed (session-replay / test) pty event:
+                        // `slot_index` names a PTY table slot; the
+                        // shared `slot`/`cancelled` prelude above is
+                        // unused here. Bytes may ride the heap payload
+                        // (an output batch past the inline bound) —
+                        // take it before any early-out so skipped
+                        // entries still free, the `.line` discipline.
+                        if (self.drain_heap_line) |old_heap| {
+                            self.allocator.free(old_heap);
+                            self.drain_heap_line = null;
+                        }
+                        if (entry.heap_line) |heap| {
+                            self.drain_heap_line = heap;
+                            entry.heap_line = null;
+                        }
+                        const pty_slot = &self.pty_slots[entry.slot_index];
+                        if (pty_slot.state == .idle or entry.channel_generation != pty_slot.generation) continue;
+                        const on_event = pty_slot.on_event;
+                        // The delivered drop count reads AT DELIVERY, the
+                        // live staged-exit drain's rule: a write refused
+                        // AFTER the exit was fed (and counted onto the
+                        // slot) still lands in the delivered tally.
+                        // Captured before retire resets the slot. Under
+                        // replay the slot count is always zero, so the
+                        // journaled count delivers verbatim.
+                        const slot_dropped = pty_slot.dropped_writes;
+                        if (entry.pty_kind == .exit) self.retirePtySlot(pty_slot);
+                        const bytes: []const u8 = if (self.drain_heap_line) |heap|
+                            heap[0..entry.line_len]
+                        else
+                            entry.line_bytes[0..entry.line_len];
+                        const event: EffectPtyEvent = .{
+                            .key = entry.key,
+                            .kind = entry.pty_kind,
+                            .bytes = bytes,
+                            .code = entry.code,
+                            .reason = entry.reason,
+                            .signal = entry.pty_signal,
+                            .dropped_writes = if (entry.pty_kind == .exit)
+                                entry.pty_dropped_writes +| slot_dropped
+                            else
+                                entry.pty_dropped_writes,
+                        };
+                        self.journalNote(.{
+                            .kind = .pty,
+                            .key = event.key,
+                            .payload = event.bytes,
+                            .pty_kind = event.kind,
+                            .code = event.code,
+                            .exit_reason = event.reason,
+                            .pty_signal = event.signal,
+                            .pty_dropped_writes = event.dropped_writes,
+                        });
+                        const deliver_fn = on_event orelse continue;
+                        return deliver_fn(event);
+                    },
                 }
             }
         }
@@ -7848,6 +9734,147 @@ pub fn Effects(comptime Msg: type) type {
             return deliver_fn(event);
         }
 
+        /// Deliver the oldest boundary-eligible LIVE pty completion:
+        /// the smallest stamp across every pty's staged output backlog
+        /// and staged exit. An output pop takes at most one chunk
+        /// (`max_effect_pty_chunk_bytes`) per call — the drain loop
+        /// keeps calling until the backlog empties, so one pass
+        /// delivers the whole coalesced backlog as a handful of
+        /// bounded records; the exit (stamped after every byte by
+        /// construction) delivers only once its ring is empty:
+        /// data-before-exit per pty. Popping also resumes a parked
+        /// reader — the back-pressure handshake's loop half.
+        fn takePtyStagedMsg(self: *Self, before: u64) ?Msg {
+            var best_index: ?usize = null;
+            var best_seq: u64 = std.math.maxInt(u64);
+            var best_exit = false;
+            for (&self.pty_slots, 0..) |*slot, index| {
+                if (slot.state == .idle) continue;
+                const shared = slot.shared orelse continue;
+                shared.mutex.lock();
+                var seq: ?u64 = null;
+                var is_exit = false;
+                if (shared.staging) |staging| {
+                    if (staging.len > 0 and shared.data_seq_valid) {
+                        seq = shared.data_seq;
+                    } else if (shared.exit_staged) {
+                        seq = shared.exit_seq;
+                        is_exit = true;
+                    }
+                } else if (shared.exit_staged) {
+                    seq = shared.exit_seq;
+                    is_exit = true;
+                }
+                shared.mutex.unlock();
+                // Empty-but-latched: release the coalescer here, the
+                // channel sweep's bare-takeMsg argument verbatim.
+                if (seq == null and shared.wake.pending.load(.seq_cst)) {
+                    shared.wake.mutex.lock();
+                    shared.wake.pending.store(false, .seq_cst);
+                    shared.wake.mutex.unlock();
+                    shared.mutex.lock();
+                    if (shared.staging) |staging| {
+                        if (staging.len > 0 and shared.data_seq_valid) {
+                            seq = shared.data_seq;
+                        } else if (shared.exit_staged) {
+                            seq = shared.exit_seq;
+                            is_exit = true;
+                        }
+                    } else if (shared.exit_staged) {
+                        seq = shared.exit_seq;
+                        is_exit = true;
+                    }
+                    shared.mutex.unlock();
+                }
+                const candidate = seq orelse continue;
+                if (candidate >= before) continue;
+                if (candidate < best_seq) {
+                    best_seq = candidate;
+                    best_index = index;
+                    best_exit = is_exit;
+                }
+            }
+            const index = best_index orelse return null;
+            const slot = &self.pty_slots[index];
+            const shared = slot.shared.?;
+            const on_event = slot.on_event;
+            var event: EffectPtyEvent = .{ .key = slot.key };
+            if (best_exit) {
+                shared.mutex.lock();
+                event.kind = .exit;
+                event.code = shared.exit_code;
+                event.signal = shared.exit_signal;
+                event.reason = shared.exit_reason;
+                event.dropped_writes = shared.dropped_writes;
+                shared.exit_staged = false;
+                shared.mutex.unlock();
+                _ = self.pty_pending_count.fetchSub(1, .seq_cst);
+                // Retire BEFORE the Msg reaches update (the key frees
+                // at delivery, the families' shared instant).
+                self.retirePtySlot(slot);
+                self.journalNote(.{
+                    .kind = .pty,
+                    .key = event.key,
+                    .pty_kind = .exit,
+                    .code = event.code,
+                    .exit_reason = event.reason,
+                    .pty_signal = event.signal,
+                    .pty_dropped_writes = event.dropped_writes,
+                });
+            } else {
+                var resume_reader = false;
+                shared.mutex.lock();
+                const staging = shared.staging.?;
+                const take = @min(staging.len, max_effect_pty_chunk_bytes);
+                var i: usize = 0;
+                while (i < take) : (i += 1) {
+                    self.pty_drain_scratch[i] = staging.data[(staging.head + i) % max_effect_pty_staging_bytes];
+                }
+                staging.head = (staging.head + take) % max_effect_pty_staging_bytes;
+                staging.len -= take;
+                const emptied = staging.len == 0;
+                var rewake = false;
+                if (emptied) {
+                    shared.data_seq_valid = false;
+                } else if (shared.owner) |owner| {
+                    // ONE output batch per pty per drain pass: re-stamp
+                    // the remaining backlog with a fresh seq (> this
+                    // pass's boundary snapshot, so `candidate >= before`
+                    // skips it here) and wake for the next pass. Without
+                    // this, a continuously writing child (`yes`) whose
+                    // io thread keeps appending to the same pre-boundary
+                    // stamp would let one pass deliver without bound and
+                    // starve every other platform event.
+                    shared.data_seq = owner.seq.fetchAdd(1, .seq_cst);
+                    rewake = true;
+                }
+                if (shared.reader_parked) {
+                    shared.reader_parked = false;
+                    resume_reader = true;
+                }
+                shared.mutex.unlock();
+                if (emptied) _ = self.pty_pending_count.fetchSub(1, .seq_cst);
+                if (rewake) ChannelHandle.requestHostWake(&shared.wake, slot.generation);
+                if (resume_reader and comptime pty_transport.supported) {
+                    pty_transport.nudge(slot.wake_pipe[1]);
+                }
+                event.bytes = self.pty_drain_scratch[0..take];
+                self.journalNote(.{
+                    .kind = .pty,
+                    .key = event.key,
+                    .payload = event.bytes,
+                    .pty_kind = .output,
+                    // Canonical output-record shape: the -1 code sentinel
+                    // every delivered non-exit event carries (and the fed
+                    // drain journals), zero signal/drops. The replay
+                    // damage gate holds records to exactly this.
+                    .code = effect_error_exit_code,
+                });
+            }
+            const deliver_fn = on_event orelse return null;
+            return deliver_fn(event);
+        }
+
         /// Best-effort decode + register of a replayed image record's
         /// bytes. Failure is loud (once per process would hide repeats;
         /// once per failure is a bounded replay-time diagnostic) but
@@ -7932,7 +9959,7 @@ pub fn Effects(comptime Msg: type) type {
         /// accumulates the bytes plus their newline into the collected
         /// output (truncating over the collect bound with the flag set,
         /// exactly like a real child that printed that line).
-        pub fn feedLine(self: *Self, key: u64, bytes: []const u8) error{EffectNotFound}!void {
+        pub fn feedLine(self: *Self, key: u64, bytes: []const u8) error{ EffectNotFound, EffectQueueFull }!void {
             const slot_index = self.findActiveFakeSlot(key, .spawn) orelse blk: {
                 const fetch_index = self.findActiveFakeSlot(key, .fetch) orelse return error.EffectNotFound;
                 if (self.slots[fetch_index].fetch_response_mode != .stream) return error.EffectNotFound;
@@ -7944,7 +9971,14 @@ pub fn Effects(comptime Msg: type) type {
                 appendCollected(slot, "\n");
                 return;
             }
-            self.produceLine(slot, @intCast(slot_index), slot.generation, bytes, false);
+            // A full queue reports loudly — never the live drop
+            // accounting: a fed line IS a journaled delivery, and the
+            // replay pump answers `EffectQueueFull` by draining through
+            // a `.wake` dispatch and feeding once more (the channel and
+            // pty feeds' back-pressure contract).
+            if (!self.produceLine(slot, @intCast(slot_index), slot.generation, bytes, false, true)) {
+                return error.EffectQueueFull;
+            }
         }
 
         /// Feed synthetic stderr bytes to the fake `.collect` effect with
@@ -8742,7 +10776,7 @@ pub fn Effects(comptime Msg: type) type {
                 // reason: retire runs at delivery, inside the very
                 // dispatch a synchronous-marshal `wake_fn` may be
                 // waiting on (see `revokeChannelWake`).
-                revokeChannelWake(shared);
+                revokeChannelWake(&shared.wake);
                 if (staging) |s| process_allocator.destroy(s);
             }
             slot.state = .idle;
@@ -8750,6 +10784,346 @@ pub fn Effects(comptime Msg: type) type {
             slot.closed_staged = false;
             slot.park_seq = 0;
             slot.park_state = .none;
+        }
+
+        fn rejectPty(self: *Self, key: u64, pty_fn: ?PtyMsgFn, regenerates: bool) void {
+            self.stagePendingPty(.{
+                .seq = self.nextPendingSeq(),
+                .event = .{ .key = key, .kind = .exit, .reason = .rejected },
+                .pty_fn = pty_fn,
+                .regenerates = regenerates,
+            });
+        }
+
+        fn findPtySlot(self: *Self, key: u64) ?*PtySlot {
+            for (&self.pty_slots) |*slot| {
+                if (slot.state != .idle and slot.key == key) return slot;
+            }
+            return null;
+        }
+
+        fn findIdlePtySlot(self: *Self) ?usize {
+            for (&self.pty_slots, 0..) |*slot, index| {
+                if (slot.state == .idle) return index;
+            }
+            return null;
+        }
+
+        fn idlePtySlotCount(self: *Self) usize {
+            var count: usize = 0;
+            for (&self.pty_slots) |*slot| {
+                if (slot.state == .idle) count += 1;
+            }
+            return count;
+        }
+
+        /// Staged EXECUTOR-TRUTH pty start failures reserve table
+        /// capacity until they deliver — `stagedChannelReservationCount`
+        /// with the identical replay-hold reasoning.
+        fn stagedPtyReservationCount(self: *Self) usize {
+            const storage = self.pendingPtyStorage();
+            var count: usize = 0;
+            var index: usize = 0;
+            while (index < self.pending_pty_len) : (index += 1) {
+                const entry = &storage[(self.pending_pty_head + index) % storage.len];
+                if (!entry.regenerates and entry.retire_slot == null) count += 1;
+            }
+            return count;
+        }
+
+        /// A pty occupies its key from the accepted spawn until its
+        /// `.exit` terminal delivers.
+        fn ptyOccupiesKey(self: *Self, key: u64) bool {
+            return self.findPtySlot(key) != null;
+        }
+
+        /// A staged executor-truth pty terminal occupies its key until
+        /// the drain delivers it — `stagedChannelOccupiesKey`'s pty
+        /// twin, same regenerating/non-regenerating line.
+        fn stagedPtyOccupiesKey(self: *Self, key: u64) bool {
+            const storage = self.pendingPtyStorage();
+            var index: usize = 0;
+            while (index < self.pending_pty_len) : (index += 1) {
+                const entry = &storage[(self.pending_pty_head + index) % storage.len];
+                if (!entry.regenerates and entry.retire_slot == null and entry.event.key == key) return true;
+            }
+            return false;
+        }
+
+        /// Count one refused write into the staged executor-truth
+        /// terminal occupying `key` — the synchronous start-failure
+        /// window, whose slot was already released so no slot tally can
+        /// carry the drop to delivery. Returns whether such a terminal
+        /// was found (the `stagedPtyOccupiesKey` predicate, with the
+        /// count folded into the same walk).
+        fn countRefusalOnStagedPtyTerminal(self: *Self, key: u64) bool {
+            const storage = self.pendingPtyStorage();
+            var index: usize = 0;
+            while (index < self.pending_pty_len) : (index += 1) {
+                const entry = &storage[(self.pending_pty_head + index) % storage.len];
+                if (!entry.regenerates and entry.retire_slot == null and entry.event.key == key) {
+                    entry.event.dropped_writes +|= 1;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// Retire a pty occupancy at terminal delivery: sever the
+        /// shared block, free the staging ring, close the transport,
+        /// and collect the io thread (which staged the exit as its
+        /// last shared touch, so the join is an epilogue wait, never a
+        /// wait on child I/O). The `PtyShared` header stays allocated
+        /// forever, the channel headers' bounded-leak invariant.
+        fn retirePtySlot(self: *Self, slot: *PtySlot) void {
+            if (slot.shared) |shared| {
+                shared.mutex.lock();
+                shared.open = false;
+                const staging = shared.staging;
+                shared.staging = null;
+                const outbound = shared.outbound;
+                shared.outbound = null;
+                shared.owner = null;
+                // The frees below happen ONLY when the io thread's
+                // completion is PROVEN: `io_done` publishes in the same
+                // critical section as the staged exit, past the thread's
+                // last block touch (it reads outbound and writes staging
+                // only inside its read loop, under this mutex, gated by
+                // `open`/`generation`). The normal exit delivery always
+                // observes it true. An ABANDONED thread — detached past
+                // a join deadline, still inside its read loop when the
+                // loop thread staged the synthetic exit — leaves it
+                // false, and its blocks LEAK instead (the teardown
+                // abandon rule): the gates make a freed-block touch
+                // impossible only for code that reaches them, and memory
+                // lifetime must not hang on every future deref staying
+                // gated. Fake and parked slots never install blocks, so
+                // this proof gates nothing there.
+                const io_settled = shared.io_done;
+                shared.mutex.unlock();
+                revokeChannelWake(&shared.wake);
+                if (io_settled) {
+                    // Only the small `PtyShared` header stays, the
+                    // channel bounded-leak rule. Freed through the SAME
+                    // seam that allocated them
+                    // (`channel_storage_allocator`): a swapped-in
+                    // tracking or arena allocator must see its own
+                    // frees, never a mismatched destroy against the
+                    // default backing.
+                    if (staging) |st| self.channel_storage_allocator.destroy(st);
+                    if (outbound) |ob| self.channel_storage_allocator.destroy(ob);
+                } else if (staging != null or outbound != null) {
+                    // Diagnostic tally of deferred-ownership leaks (one
+                    // per abandoned-thread retirement): tests pin the
+                    // free/leak correspondence through it.
+                    self.pty_blocks_leaked += 1;
+                }
+            }
+            if (comptime pty_transport.supported) {
+                if (slot.io_thread) |thread| {
+                    // DETACH, never join. Retirement runs at exit
+                    // delivery — inside the very dispatch a
+                    // synchronous-marshal `wake_fn` may be waiting on —
+                    // and the io thread's LAST act is that host wake, so
+                    // joining here would deadlock a violating hook
+                    // exactly the way `ChannelWake` forbids (revoke
+                    // mid-life, quiesce only at teardown). By retirement
+                    // the thread has published `io_done` and is past all
+                    // transport, staging, and pipe access (it only
+                    // touches the process-lifetime wake header from here
+                    // on), so detaching and reclaiming its fds is safe:
+                    // a conforming enqueue-only wake means the thread has
+                    // already exited, and a violating one lingers
+                    // harmlessly against the process-lived header.
+                    thread.detach();
+                    slot.io_thread = null;
+                }
+                if (slot.transport) |transport| {
+                    transport.close();
+                    slot.transport = null;
+                }
+                pty_transport.closeFd(slot.wake_pipe[0]);
+                pty_transport.closeFd(slot.wake_pipe[1]);
+                slot.wake_pipe = .{ -1, -1 };
+            }
+            slot.state = .idle;
+            slot.on_event = null;
+            slot.kill_requested = false;
+            slot.write_capture_len = 0;
+            slot.dropped_writes = 0;
+            slot.park_seq = 0;
+            slot.park_state = .none;
+        }
+
+        /// Start the real transport for an accepted `ptySpawn`: flatten
+        /// the bound environ (the spawn env policy, verbatim), open the
+        /// pty pair, fork the child onto it, and hand the parent end to a
+        /// dedicated io thread. Failures release the slot and stage an
+        /// executor-truth `.spawn_failed` terminal — journaled with its
+        /// real reason and FED under replay, where the re-run spawn
+        /// parks a slot this terminal retires (the channel
+        /// classification, applied to transports).
+        ///
+        /// Runs SYNCHRONOUSLY on the loop thread by design: the
+        /// spawn-position start verdict is part of the record/replay
+        /// contract (a start failure delivers at the spawn's dispatch
+        /// position, retiring the replay park). The cost is bounded —
+        /// a handful of syscalls plus the half-second exec probe, whose
+        /// unresolved case carries to the reap instead of waiting — with
+        /// one residual: the PATH walk's `access()` probes have no
+        /// timeout, so an executable searched through a stalled
+        /// NFS/autofs PATH entry stalls the loop like any synchronous
+        /// filesystem touch of that mount would.
+        fn startRealPty(self: *Self, slot: *PtySlot, options: PtySpawnOptions) void {
+            if (comptime !pty_transport.supported) {
+                // ptySpawn already refused unsupported builds.
+                unreachable;
+            }
+            const shared = slot.shared orelse blk: {
+                const created = self.channel_storage_allocator.create(PtyShared) catch {
+                    return self.failPtyStart(slot, options);
+                };
+                created.* = .{};
+                slot.shared = created;
+                break :blk created;
+            };
+            const staging = self.channel_storage_allocator.create(PtyStaging) catch {
+                return self.failPtyStart(slot, options);
+            };
+            staging.* = .{};
+            const outbound = self.channel_storage_allocator.create(PtyOutbound) catch {
+                self.channel_storage_allocator.destroy(staging);
+                return self.failPtyStart(slot, options);
+            };
+            outbound.* = .{};
+            const pipe = pty_transport.pipePair() catch {
+                self.channel_storage_allocator.destroy(outbound);
+                self.channel_storage_allocator.destroy(staging);
+                return self.failPtyStart(slot, options);
+            };
+            var env_buffer: [pty_transport.max_env_entries]pty_transport.EnvVar = undefined;
+            const env = flattenPtyEnviron(self.environ orelse fallbackEnviron(), &env_buffer) orelse {
+                self.channel_storage_allocator.destroy(outbound);
+                self.channel_storage_allocator.destroy(staging);
+                pty_transport.closeFd(pipe[0]);
+                pty_transport.closeFd(pipe[1]);
+                return self.failPtyStart(slot, options);
+            };
+            const transport = pty_transport.spawn(self.allocator, .{
+                .argv = slot.requestArgv(),
+                .env = env,
+                .term = slot.requestTerm(),
+                .cols = slot.cols,
+                .rows = slot.rows,
+            }) catch {
+                self.channel_storage_allocator.destroy(outbound);
+                self.channel_storage_allocator.destroy(staging);
+                pty_transport.closeFd(pipe[0]);
+                pty_transport.closeFd(pipe[1]);
+                return self.failPtyStart(slot, options);
+            };
+            const generation = slot.generation;
+            shared.mutex.lock();
+            shared.open = true;
+            shared.generation = generation;
+            shared.staging = staging;
+            shared.outbound = outbound;
+            shared.data_seq_valid = false;
+            shared.exit_staged = false;
+            shared.exit_code = effect_error_exit_code;
+            shared.exit_signal = 0;
+            shared.exit_reason = .exited;
+            shared.reader_parked = false;
+            shared.out_head = 0;
+            shared.out_len = 0;
+            shared.out_write_head = 0;
+            shared.out_write_count = 0;
+            shared.out_front_sent = 0;
+            shared.dropped_writes = 0;
+            shared.kill_requested = false;
+            // Every prior-session flag on the reused header must reset,
+            // or a stale value steers the new session: a leftover
+            // `reaping` would make ptyKill skip its immediate SIGKILL
+            // and fall through to the reaper's slower SIGHUP-first
+            // escalation.
+            shared.reaping = false;
+            shared.shutdown = false;
+            shared.io_done = false;
+            shared.owner = .{
+                .seq = &self.pty_seq,
+                .pending = &self.pty_pending_count,
+            };
+            shared.mutex.unlock();
+            shared.wake.mutex.lock();
+            shared.wake.generation = generation;
+            shared.wake.services = &self.wake_services;
+            shared.wake.pending.store(false, .seq_cst);
+            shared.wake.mutex.unlock();
+            // Publish the services snapshot if channels have not
+            // already (the openChannel dance, same refusal class): a
+            // pty whose snapshot cannot allocate could stage output no
+            // producer wake would ever deliver, so the spawn fails
+            // loudly instead. Publish-then-sweep, the invariant every
+            // publication site keeps.
+            if (self.services != null and self.wake_services.load(.seq_cst) == null) {
+                if (!self.materializeWakeSnapshot()) {
+                    shared.mutex.lock();
+                    shared.open = false;
+                    shared.staging = null;
+                    shared.outbound = null;
+                    shared.owner = null;
+                    shared.mutex.unlock();
+                    revokeChannelWake(&shared.wake);
+                    self.channel_storage_allocator.destroy(staging);
+                    self.channel_storage_allocator.destroy(outbound);
+                    pty_transport.closeFd(pipe[0]);
+                    pty_transport.closeFd(pipe[1]);
+                    transport.kill(false);
+                    // Bounded (the escalate-then-surrender reap): see
+                    // the thread-start failure path below.
+                    _ = transport.reapEnding();
+                    transport.close();
+                    return self.failPtyStart(slot, options);
+                }
+                if (self.hasPending()) self.wakeHost();
+            }
+            const thread = std.Thread.spawn(.{}, ptyIoLoop, .{ shared, transport, pipe[0], generation }) catch {
+                shared.mutex.lock();
+                shared.open = false;
+                shared.staging = null;
+                shared.outbound = null;
+                shared.owner = null;
+                shared.mutex.unlock();
+                revokeChannelWake(&shared.wake);
+                self.channel_storage_allocator.destroy(staging);
+                self.channel_storage_allocator.destroy(outbound);
+                pty_transport.closeFd(pipe[0]);
+                pty_transport.closeFd(pipe[1]);
+                transport.kill(false);
+                // Bounded (the escalate-then-surrender reap): the child
+                // may be wedged inside an exec on a stalled mount, and
+                // an unbounded waitpid here would freeze the UI loop
+                // instead of delivering spawn_failed.
+                _ = transport.reapEnding();
+                transport.close();
+                return self.failPtyStart(slot, options);
+            };
+            slot.transport = transport;
+            slot.io_thread = thread;
+            slot.wake_pipe = pipe;
+        }
+
+        /// Release a claimed pty slot and stage the executor-truth
+        /// start-failure terminal.
+        fn failPtyStart(self: *Self, slot: *PtySlot, options: PtySpawnOptions) void {
+            slot.state = .idle;
+            slot.on_event = null;
+            self.stagePendingPty(.{
+                .seq = self.nextPendingSeq(),
+                .event = .{ .key = options.key, .kind = .exit, .reason = .spawn_failed },
+                .pty_fn = options.on_event,
+                .regenerates = false,
+            });
         }
 
         fn rejectTimer(self: *Self, options: StartTimerOptions) void {
@@ -9361,6 +11735,49 @@ pub fn Effects(comptime Msg: type) type {
             });
         }
 
+        /// INTERN a staged Msg's KEY bytes and return the interned slice,
+        /// for a caller (the TS bridge) whose staged rejection must name
+        /// a key it has no live table slot to hold (a duplicate or
+        /// table-full spawn). The slice is INSTANCE-LIVED, freed only at
+        /// deinit: the delivered Msg's consumer may commit the slice
+        /// into its model (the TS commit walker shares pointers that
+        /// live outside the frame arena rather than copying them), so
+        /// reclaiming mid-run would dangle a committed model. Interning
+        /// bounds the storage by the app's DISTINCT key vocabulary —
+        /// keys are app-authored names, so repeat rejections of the same
+        /// key cost nothing — not by the rejection count. Call BEFORE
+        /// `stageLoopMsg` and pass the returned slice into the built
+        /// Msg. Loop-thread only; the same deterministic-replay contract
+        /// as `stageLoopMsg` rides on the caller.
+        pub fn stageLoopKey(self: *Self, key: []const u8) []const u8 {
+            if (key.len == 0) return "";
+            for (self.staged_keys[0..self.staged_keys_len]) |existing| {
+                if (std.mem.eql(u8, existing, key)) return existing;
+            }
+            if (self.staged_keys_len == self.staged_keys.len) {
+                const new_cap = if (self.staged_keys.len == 0) 8 else self.staged_keys.len * 2;
+                const grown = self.allocator.alloc([]u8, new_cap) catch
+                    @panic("effects: out of memory staging a loop-side Msg key - each staged rejection is one refused spawn's only answer and must never be dropped");
+                @memcpy(grown[0..self.staged_keys_len], self.staged_keys[0..self.staged_keys_len]);
+                if (self.staged_keys.len > 0) self.allocator.free(self.staged_keys);
+                self.staged_keys = grown;
+            }
+            const buf = self.allocator.alloc(u8, key.len) catch
+                @panic("effects: out of memory staging a loop-side Msg key - each staged rejection is one refused spawn's only answer and must never be dropped");
+            @memcpy(buf, key);
+            self.staged_keys[self.staged_keys_len] = buf;
+            self.staged_keys_len += 1;
+            return buf;
+        }
+
+        /// Free every interned staged-Msg key buffer. Deinit only: a
+        /// committed model may reference these slices for as long as the
+        /// app lives.
+        fn releaseStagedKeys(self: *Self) void {
+            for (self.staged_keys[0..self.staged_keys_len]) |buf| self.allocator.free(buf);
+            self.staged_keys_len = 0;
+        }
+
         /// The caller-staged Msg stage's current backing storage —
         /// `pendingImageStorage`'s twin.
         fn pendingStagedStorage(self: *Self) []PendingStaged {
@@ -9425,6 +11842,58 @@ pub fn Effects(comptime Msg: type) type {
             return entry;
         }
 
+        /// The pty-terminal stage's current backing storage —
+        /// `pendingImageStorage`'s twin.
+        fn pendingPtyStorage(self: *Self) []PendingPty {
+            if (self.pending_pty_spill.len > 0) return self.pending_pty_spill;
+            return &self.pending_ptys;
+        }
+
+        /// Stage one loop-side pty terminal for the next drain —
+        /// never dropping one (`stagePendingChannel`'s discipline,
+        /// including the seq-ordered insert a fed park-retiring
+        /// terminal's older stamp requires).
+        fn stagePendingPty(self: *Self, entry: PendingPty) void {
+            const storage = self.pendingPtyStorage();
+            if (self.pending_pty_len == storage.len) {
+                const grown = self.allocator.alloc(PendingPty, storage.len * 2) catch
+                    @panic("effects: out of memory staging a pty terminal - each staged entry is one ptySpawn call's only terminal and must never be dropped");
+                for (grown[0..self.pending_pty_len], 0..) |*slot, index| {
+                    slot.* = storage[(self.pending_pty_head + index) % storage.len];
+                }
+                if (self.pending_pty_spill.len > 0) self.allocator.free(self.pending_pty_spill);
+                self.pending_pty_spill = grown;
+                self.pending_pty_head = 0;
+            }
+            const active = self.pendingPtyStorage();
+            var index = self.pending_pty_len;
+            while (index > 0) : (index -= 1) {
+                const prev = active[(self.pending_pty_head + index - 1) % active.len];
+                if (prev.seq <= entry.seq) break;
+                active[(self.pending_pty_head + index) % active.len] = prev;
+            }
+            active[(self.pending_pty_head + index) % active.len] = entry;
+            self.pending_pty_len += 1;
+            self.wakeHost();
+        }
+
+        /// Pop the pty stage's head — `takePendingImage`'s twin,
+        /// including the drained-empty spill release.
+        fn takePendingPty(self: *Self) PendingPty {
+            const storage = self.pendingPtyStorage();
+            const entry = storage[self.pending_pty_head];
+            self.pending_pty_head = (self.pending_pty_head + 1) % storage.len;
+            self.pending_pty_len -= 1;
+            if (self.pending_pty_len == 0) {
+                self.pending_pty_head = 0;
+                if (self.pending_pty_spill.len > 0) {
+                    self.allocator.free(self.pending_pty_spill);
+                    self.pending_pty_spill = &.{};
+                }
+            }
+            return entry;
+        }
+
         /// Take the next loop-side pending terminal in enqueue order,
         /// merging the ring, the image stage, the channel stage, and
         /// the caller-staged Msg stage by their shared stamp so
@@ -9456,7 +11925,11 @@ pub fn Effects(comptime Msg: type) type {
                 self.pendingStagedStorage()[self.pending_staged_head].seq
             else
                 no_seq;
-            const min_seq = @min(@min(@min(ring_seq, staged_seq), video_seq), @min(image_seq, channel_seq_head));
+            const pty_seq_head: u64 = if (self.pending_pty_len > 0)
+                self.pendingPtyStorage()[self.pending_pty_head].seq
+            else
+                no_seq;
+            const min_seq = @min(@min(@min(ring_seq, staged_seq), video_seq), @min(@min(image_seq, channel_seq_head), pty_seq_head));
             if (min_seq == no_seq or min_seq >= before) return null;
             if (min_seq == staged_seq) {
                 return .{ .staged = self.takePendingStaged().msg };
@@ -9483,6 +11956,16 @@ pub fn Effects(comptime Msg: type) type {
                 return .{ .channel = .{
                     .event = staged.event,
                     .channel_fn = staged.channel_fn,
+                    .regenerates = staged.regenerates,
+                    .retire_slot = staged.retire_slot,
+                    .retire_generation = staged.retire_generation,
+                } };
+            }
+            if (min_seq == pty_seq_head) {
+                const staged = self.takePendingPty();
+                return .{ .pty = .{
+                    .event = staged.event,
+                    .pty_fn = staged.pty_fn,
                     .regenerates = staged.regenerates,
                     .retire_slot = staged.retire_slot,
                     .retire_generation = staged.retire_generation,
@@ -9531,6 +12014,11 @@ pub fn Effects(comptime Msg: type) type {
             // of the image predicates).
             if (self.channelOccupiesKey(key)) return true;
             if (self.stagedChannelOccupiesKey(key)) return true;
+            // Ptys share it too: occupied from spawn until the `.exit`
+            // terminal delivers, plus the staged executor-truth
+            // start-failure window.
+            if (self.ptyOccupiesKey(key)) return true;
+            if (self.stagedPtyOccupiesKey(key)) return true;
             return false;
         }
 
@@ -9744,7 +12232,7 @@ pub fn Effects(comptime Msg: type) type {
         /// (a raised `max_line_bytes`) ride a per-line heap allocation
         /// the drain retires; if that allocation fails the line degrades
         /// to the inline bound, truncated and flagged — never silent.
-        fn produceLine(self: *Self, slot: *Slot, slot_index: u16, generation: u32, bytes: []const u8, truncated: bool) void {
+        fn produceLine(self: *Self, slot: *Slot, slot_index: u16, generation: u32, bytes: []const u8, truncated: bool, fed: bool) bool {
             var len = @min(bytes.len, slot.line_limit);
             var entry: Entry = .{
                 .kind = .line,
@@ -9768,12 +12256,21 @@ pub fn Effects(comptime Msg: type) type {
             entry.line_len = @intCast(len);
             if (self.enqueue(&entry)) {
                 slot.dropped_pending = 0;
-            } else {
-                if (entry.heap_line) |heap| self.allocator.free(heap);
+                self.wakeHost();
+                return true;
+            }
+            if (entry.heap_line) |heap| self.allocator.free(heap);
+            if (!fed) {
+                // Live back-pressure: the drop is counted and the next
+                // delivered line carries it — the journaled truth.
                 slot.dropped_pending +|= 1;
                 slot.dropped_total +|= 1;
+                self.wakeHost();
             }
-            self.wakeHost();
+            // A FED line counts nothing: the caller reports the full
+            // queue loudly instead (a recorded delivery silently
+            // becoming a drop would diverge from the journal).
+            return false;
         }
 
         /// `produceLine` for a real spawn's blocking task: entry
@@ -9983,7 +12480,17 @@ pub fn Effects(comptime Msg: type) type {
         }
 
         fn runChild(self: *Self, ctx: *SpawnWorkerContext, slot_index: u16, generation: u32, io: std.Io) void {
-            var child = std.process.spawn(io, .{
+            // NOT under the pty spawn-window lock, deliberately: the
+            // std process start waits on its own exec-status pipe, and
+            // an `execve` stalled on a wedged mount would hold the lock
+            // unbounded — freezing the UI loop the moment a pty spawn
+            // needs it. A job fork landing inside a pty flag gap is the
+            // bounded residual instead (shared with embedder forks): the
+            // inherited copies die at the job child's exec, and a job
+            // whose exec stalls merely delays the pty's exec-pipe EOF —
+            // which the carried reap-time verdict resolves correctly, so
+            // no misclassification and no unbounded harm either way.
+            const spawn_result = std.process.spawn(io, .{
                 .argv = ctx.argv(),
                 .stdin = if (ctx.stdin_len > 0) .pipe else .ignore,
                 .stdout = .pipe,
@@ -10001,7 +12508,8 @@ pub fn Effects(comptime Msg: type) type {
                 // there, as before (see `killPublishedChildCtx` for
                 // the descendant story on both platforms).
                 .pgid = if (builtin.os.tag == .windows) null else 0,
-            }) catch return;
+            });
+            var child = spawn_result catch return;
 
             ctx.child_mutex.lock();
             ctx.child_id = child.id;
@@ -10353,7 +12861,7 @@ pub fn Effects(comptime Msg: type) type {
                     error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
                 };
                 if (byte == '\n') {
-                    self.produceLine(slot, slot_index, generation, line_buffer[0..line_len], truncated);
+                    _ = self.produceLine(slot, slot_index, generation, line_buffer[0..line_len], truncated, false);
                     line_len = 0;
                     truncated = false;
                 } else if (line_len < limit) {
@@ -10364,7 +12872,7 @@ pub fn Effects(comptime Msg: type) type {
                 }
             }
             if (line_len > 0 or truncated) {
-                self.produceLine(slot, slot_index, generation, line_buffer[0..line_len], truncated);
+                _ = self.produceLine(slot, slot_index, generation, line_buffer[0..line_len], truncated, false);
             }
         }
 

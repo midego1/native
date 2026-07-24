@@ -1,3 +1,4 @@
+const std = @import("std");
 const geometry = @import("geometry");
 const canvas = @import("canvas");
 const canvas_limits = @import("canvas_limits.zig");
@@ -105,6 +106,72 @@ pub const PresentedCanvasCommand = view_canvas.PresentedCanvasCommand;
 
 pub fn canvasRenderAnimationStartNsForView(view: *const RuntimeView) u64 {
     return @max(view.gpu_input_timestamp_ns, view.gpu_timestamp_ns);
+}
+
+/// The cancel-to-commit routing grace (see
+/// `RuntimeView.canvas_widget_ime_commit_grace`).
+pub const ImeCommitGrace = enum { none, route_to_owner, swallow };
+
+/// The split-event claim carry's key (see
+/// `RuntimeView.canvas_widget_claimed_key_grace`): which claimed
+/// activation key is waiting for its own committed literal. Only the
+/// text-producing activation keys arm one — every other claimed key's
+/// commit is nothing, so there is no split to carry.
+pub const CanvasWidgetClaimedKeyGrace = enum {
+    none,
+    space,
+    enter,
+
+    /// Whether `text` is the committed literal the armed key itself
+    /// produces — the keying that stops the carry from eating a
+    /// DIFFERENT key's text.
+    pub fn coversText(self: CanvasWidgetClaimedKeyGrace, text: []const u8) bool {
+        return switch (self) {
+            .none => false,
+            .space => std.mem.eql(u8, text, " "),
+            .enter => std.mem.eql(u8, text, "\r") or std.mem.eql(u8, text, "\n"),
+        };
+    }
+};
+
+/// Blur-side IME hygiene, shared by EVERY focus-mutation entry point —
+/// the pointer-driven focus move, the programmatic `focusView`, and the
+/// window-level `clearFocusedView` blur all route here so the class is
+/// closed, not chased per path. Hosts emit a standalone cancel when a
+/// composing view blurs, and after refocus an IM-consumed keystroke's
+/// text_input arrives BEFORE its key_down echo — a stale grace would
+/// route that fresh commit to the old editor (or swallow it) instead of
+/// the one focused now, so the grace and its owner pin die at blur (the
+/// target-less twin too, when the blurred view owns it).
+pub fn clearImeGraceOnViewBlur(runtime: anytype, view: *RuntimeView) void {
+    // The owner pin clears UNCONDITIONALLY, not only when a grace is
+    // armed: an active (never-cancelled) composition's owner surviving
+    // a view blur would redirect post-refocus input to the stale editor
+    // (the text_input-prefers-owner routing). A composition does not
+    // outlive its view's focus — hosts cancel on blur, and where one
+    // does not, the pin must die here.
+    view.canvas_widget_ime_commit_grace = .none;
+    view.canvas_widget_ime_owner_id = 0;
+    // The split-event claim carry dies too: it marks "the text_input
+    // arriving NEXT on this view belongs to the claimed key_down just
+    // routed", and a focus move breaks that adjacency — a claimed
+    // Enter/Space activation that moves focus before its key-up would
+    // otherwise leave the carry armed to swallow the refocused view's
+    // first unrelated commit.
+    view.canvas_widget_claimed_key_grace = .none;
+    if ((runtime.targetless_ime_preedit_len > 0 or
+        runtime.targetless_ime_commit_grace) and
+        runtime.targetless_ime_preedit_window == view.window_id and
+        std.mem.eql(u8, runtime.targetless_ime_preedit_label[0..runtime.targetless_ime_preedit_label_len], view.label))
+    {
+        // The buffered preedit dies with the grace — a live target-less
+        // composition surviving its surface's blur would hijack the
+        // next composition as a continuation
+        // (`ime_continuation_owned_targetless`) even after an editor
+        // takes focus, routing that editor's commit target-less.
+        runtime.targetless_ime_preedit_len = 0;
+        runtime.targetless_ime_commit_grace = false;
+    }
 }
 
 pub const RuntimeView = struct {
@@ -424,6 +491,40 @@ pub const RuntimeView = struct {
     scroll_driver_offsets: [platform.max_gpu_surface_scroll_drivers]geometry.OffsetF = undefined,
     scroll_driver_count: usize = 0,
     canvas_widget_focused_id: canvas.ObjectId = 0,
+    /// The text-entry widget whose editor OWNS the in-flight IME
+    /// composition — set when a `set_composition` routes to it, cleared
+    /// when its commit/cancel (or a direct text insertion) resolves the
+    /// sequence. A composition belongs to the editor it STARTED in:
+    /// commit and cancel route here even when focus has since moved, so
+    /// the starting editor resolves its own marked text instead of the
+    /// sequence leaking to the newly focused widget or the target-less
+    /// fallback (`canvas_widget_focused_id` is where NEW input goes;
+    /// this is where the open sequence finishes).
+    canvas_widget_ime_owner_id: canvas.ObjectId = 0,
+    /// One-shot routing grace armed by a composition CANCEL: every host
+    /// encodes a CONVERTED commit (the composed result differs from the
+    /// marked text) as cancel-then-text_input, so the text_input
+    /// immediately following a cancel still belongs to the sequence —
+    /// routed to the owner that composed it (`route_to_owner`, the
+    /// owner pin held through the cancel), or swallowed alongside an
+    /// orphaned sequence (`swallow`). Any OTHER event disarms it: a
+    /// plain Escape cancel is followed by its own key_down, which
+    /// disarms the grace before the user's next typing could misroute.
+    canvas_widget_ime_commit_grace: ImeCommitGrace = .none,
+    /// One-shot claim carry for hosts that deliver a claimed key_down
+    /// and its committed text as SEPARATE events (AppKit, Windows —
+    /// unlike GTK's key-with-text): armed when a textless key_down was
+    /// structurally claimed by the focused widget, consumed by the very
+    /// next event. The trailing text_input then counts as claimed even
+    /// though the activation may have rebuilt the tree in between —
+    /// one physical keystroke never doubles into a command and a
+    /// literal character across the event split. KEYED by which
+    /// activation key armed it: the carry swallows only that key's own
+    /// committed literal (space's " ", enter's CR/LF) — an unrelated
+    /// key's text arriving next (a second key pressed while the claimed
+    /// one is still held, on hosts that emit input-method text before
+    /// its key_down) flows instead of being eaten by a stale latch.
+    canvas_widget_claimed_key_grace: CanvasWidgetClaimedKeyGrace = .none,
     canvas_widget_focus_visible_id: canvas.ObjectId = 0,
     /// True when `canvas_widget_focus_visible_id` was written by the
     /// KEYBOARD focus contract (`setCanvasWidgetFocusFromKeyboard`) —
